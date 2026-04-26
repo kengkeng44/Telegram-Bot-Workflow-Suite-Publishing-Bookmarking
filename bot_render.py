@@ -1,10 +1,12 @@
-import os
+import asyncio
 import json
 import logging
+import os
 import requests
 from datetime import datetime
+
 from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 import anthropic
 from notion_client import Client as NotionClient
 
@@ -25,7 +27,7 @@ claude = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 notion = NotionClient(auth=NOTION_TOKEN)
 
 
-def read_with_jina(url: str) -> str:
+def _read_with_jina(url: str) -> str:
     try:
         resp = requests.get(
             f"https://r.jina.ai/{url}",
@@ -39,7 +41,7 @@ def read_with_jina(url: str) -> str:
         return ""
 
 
-def detect_source(url: str) -> str:
+def _detect_source(url: str) -> str:
     u = url.lower()
     if "instagram.com" in u:
         return "Instagram"
@@ -56,7 +58,7 @@ def detect_source(url: str) -> str:
     return "其他"
 
 
-def analyse(content: str, url: str) -> dict:
+def _analyse(content: str, url: str) -> dict:
     prompt = f"""分析以下網頁內容，只回傳 JSON，不要其他文字。
 
 URL: {url}
@@ -94,11 +96,11 @@ JSON 格式:
             "內容": "",
         }
 
-    result["來源"] = detect_source(url)
+    result["來源"] = _detect_source(url)
     return result
 
 
-def save_to_notion(url: str, data: dict) -> str:
+def _save_to_notion(url: str, data: dict) -> str:
     page = notion.pages.create(
         parent={"database_id": NOTION_DATABASE_ID},
         properties={
@@ -115,7 +117,7 @@ def save_to_notion(url: str, data: dict) -> str:
     return page["id"]
 
 
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         "歡迎使用歸檔機器人！\n\n"
         "直接傳 URL 給我，我會自動：\n"
@@ -126,7 +128,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     text = update.message.text.strip()
 
     if not (text.startswith("http://") or text.startswith("https://")):
@@ -137,9 +139,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = await update.message.reply_text("⏳ 處理中，請稍候...")
 
     try:
-        content = read_with_jina(url)
-        data = analyse(content, url)
-        save_to_notion(url, data)
+        content = await asyncio.to_thread(_read_with_jina, url)
+        data = await asyncio.to_thread(_analyse, content, url)
+        await asyncio.to_thread(_save_to_notion, url, data)
 
         reply = (
             f"✅ 已儲存到 Notion\n\n"
@@ -156,13 +158,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await msg.edit_text(f"❌ 處理失敗：{e}")
 
 
-def main():
+def main() -> None:
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     if RENDER_EXTERNAL_URL:
-        logger.info("Starting in webhook mode on port %d", PORT)
+        logger.info("Webhook mode — port %d, url %s", PORT, RENDER_EXTERNAL_URL)
         app.run_webhook(
             listen="0.0.0.0",
             port=PORT,
@@ -171,7 +173,7 @@ def main():
             drop_pending_updates=True,
         )
     else:
-        logger.info("Starting in polling mode")
+        logger.info("Polling mode")
         app.run_polling(drop_pending_updates=True)
 
 
