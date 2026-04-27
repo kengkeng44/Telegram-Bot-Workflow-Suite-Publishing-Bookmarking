@@ -81,19 +81,22 @@ def _detect_source(url: str) -> str:
     return "其他"
 
 
+VALID_CATEGORIES = ("AI科技", "生活風格", "學習成長", "設計創意", "商業財經")
+
+
 def _analyse(content: str, url: str) -> dict:
     prompt = f"""分析以下網頁內容，只回傳 JSON，不要其他文字。
 
 URL: {url}
 內容: {content[:3000]}
 
-JSON 格式:
+JSON 格式（嚴格遵守欄位名與限制）:
 {{
-  "標題": "文章標題 (50字以內)",
-  "摘要": "重點摘要 (100字以內)",
-  "標籤": "最相關的單一標籤，例如: 科技/設計/商業/美食/旅遊/生活/其他",
-  "作者": "作者或帳號名稱，找不到則填空字串",
-  "內容": "正文前200字"
+  "標題": "貼文核心主題（30字內，不要包含作者名稱）",
+  "作者": "作者帳號或姓名，盡量用 @handle 格式；找不到則空字串",
+  "摘要": "用一句話總結重點（50字內）",
+  "分類": "從以下五選一：AI科技 / 生活風格 / 學習成長 / 設計創意 / 商業財經",
+  "原文摘錄": "從原文擷取最有代表性的一句話（80字內）"
 }}"""
 
     try:
@@ -112,46 +115,66 @@ JSON 格式:
     except Exception as e:
         logger.error("Claude error: %s", e)
         result = {
-            "標題": url[:100],
-            "摘要": "無法解析內容",
-            "標籤": "其他",
+            "標題": url[:80],
             "作者": "",
-            "內容": "",
+            "摘要": "無法解析內容",
+            "分類": "AI科技",
+            "原文摘錄": "",
         }
 
-    result["來源"] = _detect_source(url)
+    # restrict 分類 to whitelist
+    if result.get("分類") not in VALID_CATEGORIES:
+        result["分類"] = "AI科技"
+
+    result["平台"] = _detect_source(url)
     return result
 
 
-_notion_props_cache: set | None = None
+_notion_props_cache: dict | None = None
 
 
-def _db_properties() -> set:
+def _db_properties() -> dict:
+    """Return {name: type} for properties on the target Notion database."""
     global _notion_props_cache
     if _notion_props_cache is None:
         db = notion.databases.retrieve(NOTION_DATABASE_ID)
-        _notion_props_cache = set(db["properties"].keys())
+        _notion_props_cache = {
+            name: prop["type"] for name, prop in db["properties"].items()
+        }
         logger.info("Notion DB properties: %s", _notion_props_cache)
     return _notion_props_cache
 
 
 def _save_to_notion(url: str, data: dict) -> str:
-    available = _db_properties()
+    prop_types = _db_properties()
     today = datetime.now().strftime("%Y-%m-%d")
 
-    candidates = {
-        "標題": {"title": [{"text": {"content": data.get("標題", url)[:100]}}]},
-        "摘要": {"rich_text": [{"text": {"content": data.get("摘要", "")[:2000]}}]},
-        "來源": {"select": {"name": data.get("來源", "其他")}},
-        "標籤": {"select": {"name": data.get("標籤", "其他")}},
+    # Build title in "topic（@author）" format
+    topic = (data.get("標題") or url)[:80]
+    author = (data.get("作者") or "").strip()
+    if author and not author.startswith("@"):
+        author = "@" + author
+    title = f"{topic}（{author}）" if author else topic
+
+    candidates: dict = {
+        "標題": {"title": [{"text": {"content": title[:100]}}]},
+        "摘要": {"rich_text": [{"text": {"content": (data.get("摘要") or "")[:2000]}}]},
+        "分類": {"select": {"name": data.get("分類", "AI科技")}},
+        "原文摘錄": {"rich_text": [{"text": {"content": (data.get("原文摘錄") or "")[:2000]}}]},
         "連結": {"url": url},
-        "作者": {"rich_text": [{"text": {"content": data.get("作者", "")[:200]}}]},
-        "內容": {"rich_text": [{"text": {"content": data.get("內容", "")[:2000]}}]},
-        "收藏日期": {"date": {"start": today}},
+        "平台": {"select": {"name": data.get("平台", "其他")}},
+        "儲存日期": {"date": {"start": today}},
     }
 
+    # 待行動: detect Status vs Select from schema (different API payload)
+    todo_type = prop_types.get("待行動")
+    if todo_type == "status":
+        candidates["待行動"] = {"status": {"name": "待整理"}}
+    elif todo_type == "select":
+        candidates["待行動"] = {"select": {"name": "待整理"}}
+
     # only write properties that actually exist in the database
-    properties = {k: v for k, v in candidates.items() if k in available}
+    properties = {k: v for k, v in candidates.items() if k in prop_types}
     missing = set(candidates) - set(properties)
     if missing:
         logger.warning("Skipping missing Notion properties: %s", missing)
@@ -192,10 +215,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         reply = (
             f"✅ 已儲存到 Notion\n\n"
             f"標題：{data.get('標題', 'N/A')}\n"
+            f"作者：{data.get('作者') or '未知'}\n"
             f"摘要：{data.get('摘要', 'N/A')}\n"
-            f"標籤：{data.get('標籤', 'N/A')}\n"
-            f"來源：{data.get('來源', 'N/A')}\n"
-            f"作者：{data.get('作者') or '未知'}"
+            f"分類：{data.get('分類', 'N/A')}\n"
+            f"平台：{data.get('平台', 'N/A')}"
         )
         await msg.edit_text(reply)
 
