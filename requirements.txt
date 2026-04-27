@@ -1,4 +1,4 @@
-python-telegram-bot==21.11.1
+python-telegram-bot[webhooks]==21.11.1
 anthropic>=0.40.0
 notion-client>=2.2.1
 requests>=2.31.0
