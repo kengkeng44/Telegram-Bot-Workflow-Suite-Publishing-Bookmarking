@@ -4,7 +4,7 @@ services:
     env: python
     plan: free
     pythonVersion: 3.11.9
-    buildCommand: rm -rf .venv && pip install -r requirements.txt
+    buildCommand: pip install --upgrade pip && pip install -r requirements.txt
     startCommand: python bot_render.py
     envVars:
       - key: TELEGRAM_BOT_TOKEN
