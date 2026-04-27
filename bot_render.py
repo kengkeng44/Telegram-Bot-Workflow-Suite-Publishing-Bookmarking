@@ -123,19 +123,42 @@ JSON 格式:
     return result
 
 
+_notion_props_cache: set | None = None
+
+
+def _db_properties() -> set:
+    global _notion_props_cache
+    if _notion_props_cache is None:
+        db = notion.databases.retrieve(NOTION_DATABASE_ID)
+        _notion_props_cache = set(db["properties"].keys())
+        logger.info("Notion DB properties: %s", _notion_props_cache)
+    return _notion_props_cache
+
+
 def _save_to_notion(url: str, data: dict) -> str:
+    available = _db_properties()
+    today = datetime.now().strftime("%Y-%m-%d")
+
+    candidates = {
+        "標題": {"title": [{"text": {"content": data.get("標題", url)[:100]}}]},
+        "摘要": {"rich_text": [{"text": {"content": data.get("摘要", "")[:2000]}}]},
+        "來源": {"select": {"name": data.get("來源", "其他")}},
+        "標籤": {"select": {"name": data.get("標籤", "其他")}},
+        "連結": {"url": url},
+        "作者": {"rich_text": [{"text": {"content": data.get("作者", "")[:200]}}]},
+        "內容": {"rich_text": [{"text": {"content": data.get("內容", "")[:2000]}}]},
+        "收藏日期": {"date": {"start": today}},
+    }
+
+    # only write properties that actually exist in the database
+    properties = {k: v for k, v in candidates.items() if k in available}
+    missing = set(candidates) - set(properties)
+    if missing:
+        logger.warning("Skipping missing Notion properties: %s", missing)
+
     page = notion.pages.create(
         parent={"database_id": NOTION_DATABASE_ID},
-        properties={
-            "標題": {"title": [{"text": {"content": data.get("標題", url)[:100]}}]},
-            "摘要": {"rich_text": [{"text": {"content": data.get("摘要", "")[:2000]}}]},
-            "來源": {"select": {"name": data.get("來源", "其他")}},
-            "標籤": {"select": {"name": data.get("標籤", "其他")}},
-            "連結": {"url": url},
-            "作者": {"rich_text": [{"text": {"content": data.get("作者", "")[:200]}}]},
-            "內容": {"rich_text": [{"text": {"content": data.get("內容", "")[:2000]}}]},
-            "收藏日期": {"date": {"start": datetime.now().strftime("%Y-%m-%d")}},
-        },
+        properties=properties,
     )
     return page["id"]
 
