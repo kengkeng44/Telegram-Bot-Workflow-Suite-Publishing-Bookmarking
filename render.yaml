@@ -5,8 +5,10 @@ services:
     plan: free
     pythonVersion: 3.11.9
     buildCommand: pip install --upgrade pip && pip install -r requirements.txt
-    startCommand: python bot_render.py
+    startCommand: python -u bot_render.py
     envVars:
+      - key: PYTHONUNBUFFERED
+        value: "1"
       - key: TELEGRAM_BOT_TOKEN
         sync: false
       - key: ANTHROPIC_API_KEY

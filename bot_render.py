@@ -2,29 +2,52 @@ import asyncio
 import json
 import logging
 import os
+import sys
 import requests
 from datetime import datetime
 
-from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
-import anthropic
-from notion_client import Client as NotionClient
+# Force stdout/stderr to be unbuffered so Render shows our logs immediately
+sys.stdout.reconfigure(line_buffering=True)
+sys.stderr.reconfigure(line_buffering=True)
+
+print("=== bot_render.py starting ===", flush=True)
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
+    stream=sys.stdout,
 )
 logger = logging.getLogger(__name__)
 
-TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
-ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
-NOTION_TOKEN = os.environ["NOTION_TOKEN"]
-NOTION_DATABASE_ID = os.environ["NOTION_DATABASE_ID"]
+
+def _require_env(name: str) -> str:
+    val = os.environ.get(name)
+    if not val:
+        print(f"FATAL: missing environment variable '{name}'", flush=True)
+        sys.exit(1)
+    print(f"env {name}: set ({len(val)} chars)", flush=True)
+    return val
+
+
+TELEGRAM_BOT_TOKEN = _require_env("TELEGRAM_BOT_TOKEN")
+ANTHROPIC_API_KEY = _require_env("ANTHROPIC_API_KEY")
+NOTION_TOKEN = _require_env("NOTION_TOKEN")
+NOTION_DATABASE_ID = _require_env("NOTION_DATABASE_ID")
 RENDER_EXTERNAL_URL = os.environ.get("RENDER_EXTERNAL_URL", "")
 PORT = int(os.environ.get("PORT", 8080))
+print(f"RENDER_EXTERNAL_URL: {RENDER_EXTERNAL_URL or '(empty - will use polling)'}", flush=True)
+print(f"PORT: {PORT}", flush=True)
+
+print("Importing telegram/anthropic/notion...", flush=True)
+from telegram import Update
+from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
+import anthropic
+from notion_client import Client as NotionClient
+print("Imports OK", flush=True)
 
 claude = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 notion = NotionClient(auth=NOTION_TOKEN)
+print("Clients initialized", flush=True)
 
 
 def _read_with_jina(url: str) -> str:
@@ -159,9 +182,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 
 def main() -> None:
+    print("Building Application...", flush=True)
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    print("Handlers registered", flush=True)
 
     if RENDER_EXTERNAL_URL:
         logger.info("Webhook mode — port %d, url %s", PORT, RENDER_EXTERNAL_URL)
@@ -179,4 +204,10 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:
+        import traceback
+        print(f"FATAL: {type(e).__name__}: {e}", flush=True)
+        traceback.print_exc()
+        sys.exit(1)
