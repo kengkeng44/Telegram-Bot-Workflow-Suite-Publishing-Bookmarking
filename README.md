@@ -1,0 +1,23 @@
+# Telegram Bot Workflow Suite — Publishing & Bookmarking
+
+兩個用 Telegram + Claude + Notion 串起來的個人自動化 bot。
+
+## 專案
+
+### `threads-bot/` — Threads 收藏 → Notion
+傳 Threads 貼文連結給 Telegram bot，自動爬內容（Playwright）→ Claude 分析（摘要／分類／情緒／標籤）→ 寫入 Notion Database。
+適合用來「收藏 + 分類」別人的 Threads 貼文。
+
+### `xiaofa-bot/` — 小發自動發文
+- `bot.py` — 把任意文字／網址訊息丟進 Telegram，Claude 整理後寫進 Notion。
+- `xiaofa_bot.py` — 透過 Threads Graph API 直接發文到自己的 Threads。
+- `v2/` — 用 Render 部署（webhook 版）的版本，含 iOS 捷徑說明。
+
+## 使用前
+
+兩個專案各自 `cp .env.example .env` 後填入金鑰，然後 `pip install -r requirements.txt`。
+詳細步驟看各子目錄的 README / CLAUDE.md / 部署文件。
+
+## 安全
+
+`.env` 已被 `.gitignore` 排除，**請勿** commit 真實金鑰。

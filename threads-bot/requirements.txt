@@ -1,0 +1,7 @@
+python-telegram-bot==21.6
+playwright==1.48.0
+notion-client==2.2.1
+anthropic>=0.50.0
+jmespath==1.0.1
+python-dotenv==1.0.1
+tenacity==9.0.0

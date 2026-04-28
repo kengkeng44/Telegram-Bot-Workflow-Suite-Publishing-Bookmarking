@@ -1,0 +1,11 @@
+.env
+.env.*
+!.env.example
+__pycache__/
+*.pyc
+.claude/
+last_failed_response.json
+.git/
+.gitignore
+README.md
+CLAUDE.md
