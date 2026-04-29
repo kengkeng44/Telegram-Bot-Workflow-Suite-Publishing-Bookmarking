@@ -1,8 +1,10 @@
-# threads-bot 專案說明
+# Data Hoarder（資料夾仍叫 `threads-bot/`）
 
 ## 一句話描述
 
-Telegram bot：用戶傳 Threads 貼文連結（支援一次多則）→ Playwright headless Chromium 爬取 GraphQL 資料 → Claude Haiku 產出摘要／分類／標籤／情緒 → 寫入 Notion Database。
+Telegram bot：使用者傳任意網址（Threads / Instagram / FB / YouTube / Medium / 任何網頁）或純文字 → Playwright headless Chromium 爬取（Threads 走 GraphQL + `data-sjs` script tag + 登入 cookie；其他走 Open Graph + 主要文字）→ Claude Haiku 產出摘要／分類／標籤／情緒 → 寫入 Notion Database。
+
+> 資料夾名 `threads-bot/` 是歷史包袱（最初只支援 Threads），現在已多平台，對外暱稱 **Data Hoarder**。改名要協調 Railway Root Directory，記錄在頂層 TODO.md。
 
 ---
 

@@ -50,6 +50,60 @@
 
 ---
 
+### 「Data Hoarder」改名（一氣呵成版）
+
+對外文字描述已改成「Data Hoarder」（README、CLAUDE.md），但資料夾名 / 服務名 / GitHub repo 名 / Telegram bot 還是 `threads-bot` / `jenho_threads_bot`。一次改完的順序：
+
+#### A. 子目錄改名（要協調 Railway，最容易出包）
+
+```powershell
+# 1. 先去 Railway dashboard 開好 → 進 Data hoarder service → Settings → Source 那頁
+# 2. 在 PowerShell 執行：
+cd C:\Users\acer\Desktop\github-upload
+git mv threads-bot data-hoarder-bot
+# 同步本機開發資料夾（可選）：
+# Rename-Item C:\Users\acer\Downloads\threads.bot C:\Users\acer\Downloads\data-hoarder-bot
+git add .
+git commit -m "Rename threads-bot/ → data-hoarder-bot/"
+git push
+# 3. 立刻去 Railway → Settings → Source → Root Directory → 改成 data-hoarder-bot → Save
+# 4. Railway 會重新 build，幾分鐘後 ACTIVE
+```
+
+⚠️ 如果第 3 步來不及做，Railway build 會失敗（找不到 Dockerfile）— 沒關係，改完 Root Directory 再點 Redeploy 就好。
+
+#### B. GitHub repo 改名
+
+1. 開 https://github.com/kengkeng44/Telegram-Bot-Workflow-Suite-Publishing-Bookmarking/settings
+2. **Repository name** → 改成例如 `Data-Hoarder` → Rename
+3. 改完 GitHub 會自動 redirect 舊 URL，**Railway 不用立刻改**（git remote 也還能用）
+4. 想徹底乾淨：本機更新 git remote
+   ```powershell
+   cd C:\Users\acer\Desktop\github-upload
+   git remote set-url origin https://github.com/kengkeng44/Data-Hoarder.git
+   git remote -v   # 確認
+   ```
+
+#### C. Telegram bot 改名
+
+1. BotFather → `/setname` → 選 `@jenho_threads_bot` → 輸入新顯示名（例 `Data Hoarder`）
+2. BotFather → `/setusername` → 選 `@jenho_threads_bot` → 輸入新 username（例 `jenho_data_hoarder_bot`）
+   - ⚠️ 改 username = `t.me/jenho_threads_bot` 連結失效，新連結變 `t.me/jenho_data_hoarder_bot`
+   - Token **不會變**，bot 不用重新部署
+3. 改 bot 簡介（可選）：BotFather → `/setdescription`
+
+#### D. Infisical project 改名
+
+1. https://app.infisical.com → 進 `threads-bot` project
+2. 左下 Settings → General → Project Name → 改成 `data-hoarder-bot` → Save
+3. 不影響 token 或同步，本機 `.infisical.json` 用 ID 鎖定，名字改了不會壞
+
+#### E. Notion Database 改名（隨意）
+
+直接在 Notion 把 Database 改名。`bot.py` 用 `NOTION_DATABASE_ID` 找資料庫，跟名字無關。
+
+---
+
 ### 修 `/usage` 的 Railway GraphQL schema
 
 **現況**：`/usage` 第一段 `me { id email name }` 能查（token 有效），但第二段 `workspaces { edges { node {} } }` + `usage(...)` 在 2026-04 失敗（HTTP 400），目前 fallback 給 dashboard 連結。

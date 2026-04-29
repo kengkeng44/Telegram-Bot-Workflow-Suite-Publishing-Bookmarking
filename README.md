@@ -36,7 +36,10 @@ flowchart LR
 
 ## 📦 專案架構
 
-### `threads-bot/` — 多平台收藏 → Notion
+### `threads-bot/` — Data Hoarder（多平台收藏 → Notion）
+
+> 📦 資料夾還叫 `threads-bot/`（歷史包袱），實際用途是「多平台收藏 bot」，故對外暱稱 **Data Hoarder**。資料夾改名要協調 Railway Root Directory，已記在 [TODO.md](TODO.md) 之後再做。
+
 傳任何網址或文字給 Telegram bot，自動爬內容（Playwright）→ Claude 分析（摘要／分類／情緒／標籤）→ 寫入 Notion Database。
 
 **支援來源**：
