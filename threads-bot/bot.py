@@ -26,6 +26,7 @@ NOTION_TOKEN = os.environ["NOTION_TOKEN"]
 NOTION_DATABASE_ID = os.environ["NOTION_DATABASE_ID"]
 ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
 ALLOWED_USER_ID = int(os.environ.get("ALLOWED_USER_ID", "0"))
+THREADS_STATE_JSON = os.environ.get("THREADS_STATE_JSON")  # 可選：登入後的 storage_state JSON
 
 # ==== Clients & 共用狀態 ====
 notion = NotionClient(auth=NOTION_TOKEN)
@@ -116,13 +117,14 @@ def _extract_post_from_html(html: str) -> dict | None:
     pattern = r'<script[^>]*type="application/json"[^>]*data-sjs[^>]*>(.*?)</script>'
     matches = re.findall(pattern, html, re.DOTALL)
     log.info(f"[scrape_threads] HTML 中找到 {len(matches)} 個 data-sjs script tags")
+
+    # Path 1: 找含 thread_items 的（登入用戶版）
     candidates = [m for m in matches if "thread_items" in m]
-    log.info(f"[scrape_threads] 其中 {len(candidates)} 個包含 thread_items")
+    log.info(f"[scrape_threads] 含 thread_items: {len(candidates)} 個")
     for raw in candidates:
         try:
             data = json.loads(raw)
-        except Exception as e:
-            log.debug(f"[scrape_threads] script tag JSON parse 失敗: {e}")
+        except Exception:
             continue
         for items in _nested_lookup("thread_items", data):
             if isinstance(items, list):
@@ -130,14 +132,74 @@ def _extract_post_from_html(html: str) -> dict | None:
                     post = it.get("post") if isinstance(it, dict) else None
                     if post and isinstance(post, dict):
                         return post
+
+    # Path 2: 找含 caption 的任何 script tag，nested_lookup 拼湊資料（未登入版常用）
+    cap_candidates = [m for m in matches if '"caption"' in m and '"text"' in m]
+    log.info(f"[scrape_threads] 含 caption+text: {len(cap_candidates)} 個")
+    for raw in cap_candidates:
+        try:
+            data = json.loads(raw)
+        except Exception:
+            continue
+        captions = _nested_lookup("caption", data)
+        for cap in captions:
+            if isinstance(cap, dict) and isinstance(cap.get("text"), str) and cap["text"].strip():
+                username = ""
+                for u in _nested_lookup("user", data):
+                    if isinstance(u, dict) and isinstance(u.get("username"), str):
+                        username = u["username"]
+                        break
+                return {
+                    "caption": cap,
+                    "user": {"username": username},
+                    "image_versions2": {},
+                }
     return None
+
+
+def _get_meta(html: str, prop: str) -> str | None:
+    """彈性匹配 <meta property=X content=Y> 或 <meta content=Y property=X>，引號 ' 或 " 都支援。"""
+    for pattern in [
+        rf'<meta\s+[^>]*property=["\']{re.escape(prop)}["\'][^>]*content=["\']([^"\']*)["\']',
+        rf'<meta\s+[^>]*content=["\']([^"\']*)["\'][^>]*property=["\']{re.escape(prop)}["\']',
+        rf'<meta\s+[^>]*name=["\']{re.escape(prop)}["\'][^>]*content=["\']([^"\']*)["\']',
+    ]:
+        m = re.search(pattern, html, re.IGNORECASE)
+        if m:
+            return m.group(1)
+    return None
+
+
+def _extract_from_og_meta(html: str) -> dict | None:
+    desc = _get_meta(html, "og:description")
+    title = _get_meta(html, "og:title")
+    image = _get_meta(html, "og:image")
+    log.info(f"[scrape_threads] og 偵測: description={'有' if desc else '無'}({len(desc) if desc else 0}字), title={'有' if title else '無'}, image={'有' if image else '無'}")
+    if not desc or not desc.strip():
+        return None
+    text = desc
+    author_raw = title or ""
+    author_match = re.search(r'@(\w+)', author_raw)
+    author = author_match.group(1) if author_match else author_raw.split(" on Threads")[0].strip()
+    return {
+        "text": text,
+        "author": author,
+        "image_urls": [image] if image else [],
+    }
 
 
 async def _scrape_threads(url: str) -> dict:
     log.info(f"[scrape_threads] start url={url}")
     browser = await _ensure_browser()
     captured = []
-    context = await browser.new_context(user_agent=USER_AGENT)
+    storage_state = None
+    if THREADS_STATE_JSON:
+        try:
+            storage_state = json.loads(THREADS_STATE_JSON)
+            log.info(f"[scrape_threads] 使用登入 cookie ({len(storage_state.get('cookies', []))} cookies)")
+        except Exception as e:
+            log.warning(f"[scrape_threads] THREADS_STATE_JSON parse 失敗: {e}")
+    context = await browser.new_context(user_agent=USER_AGENT, storage_state=storage_state)
     await context.route("**/*", _block_heavy_resources)
     page = await context.new_page()
 
@@ -199,13 +261,18 @@ async def _scrape_threads(url: str) -> dict:
 
     match = re.search(r'"caption":\{"text":"([^"]+)"', html)
     if match:
-        log.info("[scrape_threads] ⚠️ graphql 失敗但 HTML regex fallback 命中")
+        log.info("[scrape_threads] ⚠️ regex fallback 命中（無作者/圖片）")
         return {"text": match.group(1), "author": "", "image_urls": []}
+
+    # 最後保底：Open Graph meta（摘要而非完整內文，但保證有東西）
+    og = _extract_from_og_meta(html)
+    if og:
+        log.info(f"[scrape_threads] ⚠️ og:meta fallback 命中, author={og['author']}, text_len={len(og['text'])}")
+        return og
 
     log.warning(
         f"[scrape_threads] ❌ 全部失敗。captured={len(captured)}, html_len={len(html)}, "
-        f"final_url={final_url}, page_status={page_status}。"
-        f"可能原因：(1) Threads 阻擋雲端 IP (2) Threads 改版 (3) 貼文需登入"
+        f"final_url={final_url}, page_status={page_status}"
     )
     return {"text": "", "author": "", "image_urls": []}
 
