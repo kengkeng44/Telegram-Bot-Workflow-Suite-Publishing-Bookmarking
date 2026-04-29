@@ -50,6 +50,11 @@ flowchart LR
 兩個專案各自 `cp .env.example .env` 後填入金鑰，然後 `pip install -r requirements.txt`。
 詳細步驟看各子目錄的 README / CLAUDE.md / 部署文件。
 
+## 📝 想看實作筆記？
+
+- [LESSONS.md](LESSONS.md) — 這個專案踩過的坑跟學到的事（secret 管理、爬蟲、雲端部署、防呆）
+- [TODO.md](TODO.md) — 還沒做的改進跟想法
+
 ## 🔐 安全
 
 - `.env` 已被 `.gitignore` 排除。
