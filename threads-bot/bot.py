@@ -98,6 +98,7 @@ def _extract_image_urls(node: dict) -> list[str]:
 
 
 async def _scrape_threads(url: str) -> dict:
+    log.info(f"[scrape_threads] start url={url}")
     browser = await _ensure_browser()
     captured = []
     context = await browser.new_context(user_agent=USER_AGENT)
@@ -108,12 +109,17 @@ async def _scrape_threads(url: str) -> dict:
         if "/graphql/query" in response.url or "BarcelonaPostPageQuery" in response.url:
             try:
                 captured.append(await response.json())
-            except Exception:
-                pass
+            except Exception as e:
+                log.warning(f"[scrape_threads] 攔截到 graphql 但 parse json 失敗: {e}")
 
     page.on("response", _on_response)
+    final_url = None
+    page_status = None
     try:
-        await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+        resp = await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+        final_url = page.url
+        page_status = resp.status if resp else None
+        log.info(f"[scrape_threads] page loaded status={page_status} final_url={final_url}")
         loop = asyncio.get_event_loop()
         deadline = loop.time() + 8
         while not captured and loop.time() < deadline:
@@ -121,12 +127,18 @@ async def _scrape_threads(url: str) -> dict:
         if captured:
             await asyncio.sleep(0.6)
         html = await page.content()
+    except Exception as e:
+        log.error(f"[scrape_threads] page.goto 失敗: {type(e).__name__}: {e}")
+        html = ""
     finally:
         await context.close()
+
+    log.info(f"[scrape_threads] captured={len(captured)} graphql responses, html_len={len(html)}")
 
     for data in captured:
         node = jmespath.search("data.data.containing_thread.thread_items[*].post | [0]", data)
         if node:
+            log.info(f"[scrape_threads] ✅ jmespath 命中 node, author={node.get('user', {}).get('username', '')}")
             return {
                 "text": (node.get("caption") or {}).get("text", ""),
                 "author": node.get("user", {}).get("username", ""),
@@ -134,14 +146,21 @@ async def _scrape_threads(url: str) -> dict:
             }
 
     if captured:
-        Path(__file__).parent.joinpath("last_failed_response.json").write_text(
-            json.dumps(captured[0], ensure_ascii=False, indent=2), encoding="utf-8"
+        log.warning(
+            f"[scrape_threads] 抓到 {len(captured)} 個 graphql response 但 jmespath 都找不到節點。"
+            f"第一個 response 的 top-level keys: {list(captured[0].keys()) if isinstance(captured[0], dict) else type(captured[0]).__name__}"
         )
-        log.warning("Threads GraphQL 抓到但解析失敗 → last_failed_response.json")
 
     match = re.search(r'"caption":\{"text":"([^"]+)"', html)
     if match:
+        log.info("[scrape_threads] ⚠️ graphql 失敗但 HTML regex fallback 命中")
         return {"text": match.group(1), "author": "", "image_urls": []}
+
+    log.warning(
+        f"[scrape_threads] ❌ 全部失敗。captured={len(captured)}, html_len={len(html)}, "
+        f"final_url={final_url}, page_status={page_status}。"
+        f"可能原因：(1) Threads 阻擋雲端 IP (2) Threads 改版 jmespath path 過時 (3) 貼文需登入"
+    )
     return {"text": "", "author": "", "image_urls": []}
 
 
