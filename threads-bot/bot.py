@@ -27,6 +27,7 @@ NOTION_DATABASE_ID = os.environ["NOTION_DATABASE_ID"]
 ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
 ALLOWED_USER_ID = int(os.environ.get("ALLOWED_USER_ID", "0"))
 THREADS_STATE_JSON = os.environ.get("THREADS_STATE_JSON")  # 可選：登入後的 storage_state JSON
+BOT_USER_ID = int(TELEGRAM_TOKEN.split(":")[0])  # bot 自己的 user id = token 冒號前的數字
 
 # ==== Clients & 共用狀態 ====
 notion = NotionClient(auth=NOTION_TOKEN)
@@ -46,7 +47,10 @@ SCRAPE_SEM = asyncio.Semaphore(1)
 
 
 def _allowed(update: Update) -> bool:
-    return not (ALLOWED_USER_ID and update.effective_user.id != ALLOWED_USER_ID)
+    if not ALLOWED_USER_ID:
+        return True
+    uid = update.effective_user.id
+    return uid == ALLOWED_USER_ID or uid == BOT_USER_ID
 
 
 # ==== 平台偵測 ====
@@ -490,13 +494,48 @@ async def recent(update: Update, _: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown", disable_web_page_preview=True)
 
 
+_TRACKING_PARAMS = {
+    # Threads / Meta
+    "xmt", "slof", "igsh", "igshid", "fbclid",
+    # Google / 廣告
+    "gclid", "dclid", "gbraid", "wbraid",
+    # YouTube 分享
+    "si", "feature", "pp",
+    # Mailchimp / 通用 newsletter
+    "mc_eid", "mc_cid",
+    # 通用 referral
+    "ref", "ref_src", "ref_url", "source",
+    # Branch / 連結深層
+    "_branch_match_id", "_branch_referrer",
+    # 雜項
+    "spm", "share_source",
+}
+_TRACKING_PREFIXES = ("utm_",)
+
+
+def _clean_url(url: str) -> str:
+    """移除常見追蹤參數，回傳乾淨 URL；解析失敗就照原樣回。"""
+    from urllib.parse import urlparse, urlunparse, parse_qsl, urlencode
+    try:
+        p = urlparse(url)
+        kept = [
+            (k, v) for k, v in parse_qsl(p.query, keep_blank_values=True)
+            if k.lower() not in _TRACKING_PARAMS
+            and not any(k.lower().startswith(pref) for pref in _TRACKING_PREFIXES)
+        ]
+        return urlunparse(p._replace(query=urlencode(kept)))
+    except Exception:
+        return url
+
+
 def extract_urls(text: str) -> list[str]:
-    """抽出所有 http(s) URL，處理 URL 黏在一起的情況"""
+    """抽出所有 http(s) URL，處理 URL 黏在一起的情況；自動清掉追蹤參數。"""
     raw = re.findall(r"https?://[^\s]+", text)
     out = []
     for r in raw:
         sec = re.search(r"https?://", r[8:])
         u = r[:8 + sec.start()] if sec else r
+        u = _clean_url(u)
         if u not in out:
             out.append(u)
     return out
@@ -521,10 +560,18 @@ async def _process_one(source: dict) -> tuple[bool, str]:
 
 
 async def handle_message(update: Update, _: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text or ""
+    is_bot_self = update.effective_user and update.effective_user.id == BOT_USER_ID
+
+    # 防無限迴圈：bot 自己發的訊息只在含 URL 時才處理
+    # （否則 bot 回的「✅ 完成」會被當新訊息再處理）
+    if is_bot_self and not re.search(r"https?://", text):
+        log.debug("[handle_message] 略過 bot-self 非 URL 訊息: %r", text[:50])
+        return
+
     if not _allowed(update):
         await update.message.reply_text("⛔ 沒有權限")
         return
-    text = update.message.text or ""
     urls = extract_urls(text)
 
     # 構建處理清單：URL 們 + （如果還有非 URL 文字）一筆純文字
