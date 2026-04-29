@@ -598,18 +598,31 @@ def _query_railway(query: str, variables: dict | None = None) -> dict:
 def get_railway_usage() -> dict:
     if not RAILWAY_API_TOKEN:
         return {"error": "RAILWAY_API_TOKEN 未設"}
+    # Step 1: 用最簡單的 query 確認 token 有效
+    try:
+        me_data = _query_railway("query { me { id email name } }")
+        me = me_data.get("me", {}) or {}
+    except Exception as e:
+        log.exception("Railway 基本查詢失敗")
+        return {"error": f"token 無效或 schema 改了: {type(e).__name__}: {e}"}
+
+    result = {
+        "name": me.get("name") or me.get("email") or "?",
+        "estimated_cost": None,
+        "dashboard_url": "https://railway.com/account/usage",
+    }
+
+    # Step 2: 試著拿用量數字（schema 可能變動，失敗就跳過）
     try:
         from datetime import datetime, timezone
-        me_data = _query_railway("query { me { id email workspaces { id name } } }")
-        workspaces = me_data.get("me", {}).get("workspaces", []) or []
-        if not workspaces:
-            return {"error": "找不到 workspace"}
-        ws = workspaces[0]
-        ws_id = ws["id"]
+        ws_data = _query_railway("query { me { workspaces { edges { node { id name } } } } }")
+        edges = ((ws_data.get("me") or {}).get("workspaces") or {}).get("edges") or []
+        ws = (edges[0]["node"] if edges else None)
+        if not ws:
+            raise RuntimeError("workspaces 為空")
 
         now = datetime.now(timezone.utc)
         start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-
         usage_query = """
         query usage($workspaceId: String!, $startDate: DateTime!, $endDate: DateTime!, $measurements: [MetricMeasurement!]!) {
             usage(workspaceId: $workspaceId, startDate: $startDate, endDate: $endDate, measurements: $measurements) {
@@ -619,22 +632,20 @@ def get_railway_usage() -> dict:
         }
         """
         usage_data = _query_railway(usage_query, {
-            "workspaceId": ws_id,
+            "workspaceId": ws["id"],
             "startDate": start.isoformat(),
             "endDate": now.isoformat(),
             "measurements": ["ESTIMATED_USAGE"],
         })
         items = usage_data.get("usage", []) or []
         cost = sum(float(i.get("value") or 0) for i in items if i.get("measurement") == "ESTIMATED_USAGE")
-        return {
-            "workspace": ws.get("name", "?"),
-            "estimated_cost": cost,
-            "period_start": start.strftime("%Y-%m-%d"),
-            "now": now.strftime("%Y-%m-%d %H:%M UTC"),
-        }
+        result["workspace"] = ws.get("name")
+        result["estimated_cost"] = cost
+        result["period_start"] = start.strftime("%Y-%m-%d")
     except Exception as e:
-        log.exception("Railway usage 查詢失敗")
-        return {"error": f"{type(e).__name__}: {e}"}
+        log.warning(f"Railway 用量查詢失敗（schema 可能不同），fallback 顯示 dashboard 連結。原因：{e}")
+
+    return result
 
 
 async def usage_cmd(update: Update, _: ContextTypes.DEFAULT_TYPE):
@@ -646,20 +657,29 @@ async def usage_cmd(update: Update, _: ContextTypes.DEFAULT_TYPE):
     if "error" in result:
         await update.message.reply_text(f"❌ {result['error']}")
         return
-    cost = result["estimated_cost"]
-    free = 5.00
-    remaining = max(0.0, free - cost)
-    bar_full = int(min(cost / free, 1.0) * 10)
-    bar = "▰" * bar_full + "▱" * (10 - bar_full)
-    msg = (
-        f"📊 Railway 用量（{result['workspace']}）\n"
-        f"━━━━━━━━━━━━━━━━\n"
-        f"期間：{result['period_start']} ~ 今\n"
-        f"已用：${cost:.2f}\n"
-        f"剩餘：${remaining:.2f} / $5.00\n"
-        f"{bar}  {cost / free * 100:.1f}%"
-    )
-    await update.message.reply_text(msg)
+    cost = result.get("estimated_cost")
+    if cost is not None:
+        free = 5.00
+        remaining = max(0.0, free - cost)
+        bar_full = int(min(cost / free, 1.0) * 10)
+        bar = "▰" * bar_full + "▱" * (10 - bar_full)
+        msg = (
+            f"📊 Railway 用量（{result.get('workspace', '?')}）\n"
+            f"━━━━━━━━━━━━━━━━\n"
+            f"期間：{result['period_start']} ~ 今\n"
+            f"已用：${cost:.2f}\n"
+            f"剩餘：${remaining:.2f} / $5.00\n"
+            f"{bar}  {cost / free * 100:.1f}%"
+        )
+    else:
+        msg = (
+            f"📊 Railway 帳號\n"
+            f"━━━━━━━━━━━━━━━━\n"
+            f"已連線：{result['name']}\n"
+            f"⚠️ 自動取用量失敗（Railway schema 改了）\n"
+            f"請看：{result['dashboard_url']}"
+        )
+    await update.message.reply_text(msg, disable_web_page_preview=True)
 
 
 async def _shutdown_browser(_app):

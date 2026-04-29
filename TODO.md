@@ -50,6 +50,14 @@
 
 ---
 
+### 修 `/usage` 的 Railway GraphQL schema
+
+**現況**：`/usage` 第一段 `me { id email name }` 能查（token 有效），但第二段 `workspaces { edges { node {} } }` + `usage(...)` 在 2026-04 失敗（HTTP 400），目前 fallback 給 dashboard 連結。
+
+**怎麼修**：去 https://railway.com/account/usage 用 Chrome DevTools → Network → 看 dashboard 自己打的 GraphQL request，把它的 query + variables 抄出來貼進 `get_railway_usage()`。Railway schema 沒公開文件、定期會改，靠 reverse engineering 比較準。
+
+---
+
 ## 🟢 想到再做
 
 - [ ] xiaofa-bot 也接 Infisical（目前只有本機 .env）
