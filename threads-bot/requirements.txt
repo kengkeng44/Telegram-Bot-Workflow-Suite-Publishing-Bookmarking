@@ -5,3 +5,4 @@ anthropic>=0.50.0
 jmespath==1.0.1
 python-dotenv==1.0.1
 tenacity==9.0.0
+aiohttp==3.10.10

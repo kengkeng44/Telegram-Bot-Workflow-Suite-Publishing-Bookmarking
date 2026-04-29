@@ -14,6 +14,7 @@ from pathlib import Path
 
 from telegram import Update
 from telegram.ext import Application, MessageHandler, CommandHandler, filters, ContextTypes
+from aiohttp import web
 from playwright.async_api import async_playwright
 from notion_client import Client as NotionClient
 from anthropic import Anthropic
@@ -28,6 +29,7 @@ ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
 ALLOWED_USER_ID = int(os.environ.get("ALLOWED_USER_ID", "0"))
 THREADS_STATE_JSON = os.environ.get("THREADS_STATE_JSON")  # 可選：登入後的 storage_state JSON
 BOT_USER_ID = int(TELEGRAM_TOKEN.split(":")[0])  # bot 自己的 user id = token 冒號前的數字
+INGEST_SECRET = os.environ.get("INGEST_SECRET")  # webhook 認證用的 secret，不設則 webhook 不啟動
 
 # ==== Clients & 共用狀態 ====
 notion = NotionClient(auth=NOTION_TOKEN)
@@ -729,6 +731,72 @@ async def usage_cmd(update: Update, _: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(msg, disable_web_page_preview=True)
 
 
+# ==== HTTP Webhook（給 iOS Shortcut 等外部呼叫用）====
+_ptb_bot = None  # post_init 後填入，給 webhook handler 用
+
+
+async def _process_via_webhook(url: str):
+    """從 HTTP webhook 觸發的處理流程，等同 handle_message 但沒有 update 物件。"""
+    if not (_ptb_bot and ALLOWED_USER_ID):
+        log.error("[webhook] bot 或 ALLOWED_USER_ID 沒準備好，跳過")
+        return
+    cleaned = _clean_url(url)
+    msg = await _ptb_bot.send_message(chat_id=ALLOWED_USER_ID, text=f"⏳ Webhook 收到：{cleaned[:80]}")
+    try:
+        existing = await asyncio.to_thread(_existing_urls_from_db)
+        if cleaned in existing:
+            await msg.edit_text("⏭ 已存過")
+            return
+        platform = detect_platform(cleaned)
+        await msg.edit_text(f"⏳ 爬取 {platform}...")
+        scraped = await scrape_url(cleaned, platform)
+        source = {**scraped, "url": cleaned, "platform": platform}
+        await msg.edit_text("⏳ Claude 分析...")
+        ok, line = await _process_one(source)
+        await msg.edit_text(f"完成（webhook）\n\n{line}", disable_web_page_preview=True)
+    except Exception as e:
+        log.exception("[webhook] 處理失敗：%s", cleaned)
+        try:
+            await msg.edit_text(f"❌ {type(e).__name__}: {e}")
+        except Exception:
+            pass
+
+
+async def _ingest_handler(request: web.Request) -> web.Response:
+    secret = request.headers.get("X-Auth-Secret") or request.query.get("secret", "")
+    if not INGEST_SECRET or secret != INGEST_SECRET:
+        log.warning("[webhook] 401 from %s", request.remote)
+        return web.Response(status=401, text="Unauthorized")
+    url = request.query.get("url") or ""
+    if request.method == "POST":
+        try:
+            body = await request.json()
+            url = body.get("url") or url
+        except Exception:
+            pass
+    if not url.startswith(("http://", "https://")):
+        return web.Response(status=400, text="Missing or invalid url")
+    asyncio.create_task(_process_via_webhook(url))
+    return web.json_response({"status": "queued", "url": url})
+
+
+async def _start_webhook_server(application):
+    global _ptb_bot
+    _ptb_bot = application.bot
+    if not INGEST_SECRET:
+        log.warning("[webhook] INGEST_SECRET 未設，webhook 伺服器不啟動")
+        return
+    web_app = web.Application()
+    web_app.router.add_route("*", "/ingest", _ingest_handler)
+    web_app.router.add_get("/health", lambda r: web.Response(text="ok"))
+    runner = web.AppRunner(web_app)
+    await runner.setup()
+    port = int(os.environ.get("PORT", "8080"))
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    log.info("[webhook] 伺服器啟動在 :%d", port)
+
+
 async def _shutdown_browser(_app):
     global _browser, _playwright
     if _browser:
@@ -743,6 +811,7 @@ def main():
     app = (
         Application.builder()
         .token(TELEGRAM_TOKEN)
+        .post_init(_start_webhook_server)
         .post_shutdown(_shutdown_browser)
         .build()
     )
