@@ -97,6 +97,42 @@ def _extract_image_urls(node: dict) -> list[str]:
     return urls
 
 
+def _nested_lookup(key: str, obj):
+    """遞迴在 dict/list 中找所有 key 對應的值。"""
+    results = []
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            if k == key:
+                results.append(v)
+            results.extend(_nested_lookup(key, v))
+    elif isinstance(obj, list):
+        for item in obj:
+            results.extend(_nested_lookup(key, item))
+    return results
+
+
+def _extract_post_from_html(html: str) -> dict | None:
+    """Threads 2026 改版：資料嵌在 <script type=\"application/json\" data-sjs> 內。"""
+    pattern = r'<script[^>]*type="application/json"[^>]*data-sjs[^>]*>(.*?)</script>'
+    matches = re.findall(pattern, html, re.DOTALL)
+    log.info(f"[scrape_threads] HTML 中找到 {len(matches)} 個 data-sjs script tags")
+    candidates = [m for m in matches if "thread_items" in m]
+    log.info(f"[scrape_threads] 其中 {len(candidates)} 個包含 thread_items")
+    for raw in candidates:
+        try:
+            data = json.loads(raw)
+        except Exception as e:
+            log.debug(f"[scrape_threads] script tag JSON parse 失敗: {e}")
+            continue
+        for items in _nested_lookup("thread_items", data):
+            if isinstance(items, list):
+                for it in items:
+                    post = it.get("post") if isinstance(it, dict) else None
+                    if post and isinstance(post, dict):
+                        return post
+    return None
+
+
 async def _scrape_threads(url: str) -> dict:
     log.info(f"[scrape_threads] start url={url}")
     browser = await _ensure_browser()
@@ -151,6 +187,16 @@ async def _scrape_threads(url: str) -> dict:
             f"第一個 response 的 top-level keys: {list(captured[0].keys()) if isinstance(captured[0], dict) else type(captured[0]).__name__}"
         )
 
+    # 新版 Threads (2026) 改用 server-side render，資料嵌在 HTML script tag
+    post_node = _extract_post_from_html(html)
+    if post_node:
+        log.info(f"[scrape_threads] ✅ HTML script tag fallback 命中, author={post_node.get('user', {}).get('username', '')}")
+        return {
+            "text": (post_node.get("caption") or {}).get("text", ""),
+            "author": post_node.get("user", {}).get("username", ""),
+            "image_urls": _extract_image_urls(post_node),
+        }
+
     match = re.search(r'"caption":\{"text":"([^"]+)"', html)
     if match:
         log.info("[scrape_threads] ⚠️ graphql 失敗但 HTML regex fallback 命中")
@@ -159,7 +205,7 @@ async def _scrape_threads(url: str) -> dict:
     log.warning(
         f"[scrape_threads] ❌ 全部失敗。captured={len(captured)}, html_len={len(html)}, "
         f"final_url={final_url}, page_status={page_status}。"
-        f"可能原因：(1) Threads 阻擋雲端 IP (2) Threads 改版 jmespath path 過時 (3) 貼文需登入"
+        f"可能原因：(1) Threads 阻擋雲端 IP (2) Threads 改版 (3) 貼文需登入"
     )
     return {"text": "", "author": "", "image_urls": []}
 
