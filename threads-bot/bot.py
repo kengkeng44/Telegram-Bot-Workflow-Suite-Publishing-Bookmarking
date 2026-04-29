@@ -581,8 +581,8 @@ RAILWAY_GRAPHQL = "https://backboard.railway.com/graphql/v2"
 
 
 def _query_railway(query: str, variables: dict | None = None) -> dict:
-    import requests as _requests
-    res = _requests.post(
+    import httpx
+    res = httpx.post(
         RAILWAY_GRAPHQL,
         json={"query": query, "variables": variables or {}},
         headers={"Authorization": f"Bearer {RAILWAY_API_TOKEN}"},
