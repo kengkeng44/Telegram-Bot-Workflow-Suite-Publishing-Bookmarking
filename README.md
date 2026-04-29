@@ -36,9 +36,22 @@ flowchart LR
 
 ## 📦 專案架構
 
-### `threads-bot/` — Threads 收藏 → Notion
-傳 Threads 貼文連結給 Telegram bot，自動爬內容（Playwright）→ Claude 分析（摘要／分類／情緒／標籤）→ 寫入 Notion Database。
-適合用來「收藏 + 分類」別人的 Threads 貼文。
+### `threads-bot/` — 多平台收藏 → Notion
+傳任何網址或文字給 Telegram bot，自動爬內容（Playwright）→ Claude 分析（摘要／分類／情緒／標籤）→ 寫入 Notion Database。
+
+**支援來源**：
+- **Threads**（自家 + 別人公開貼文）— 走專用 GraphQL / `data-sjs` script tag 解析
+- **Instagram / Facebook / YouTube / Medium / X / 任何網頁** — 走 `_scrape_generic`，抓 `<meta>` Open Graph + 主要文字
+- **純文字筆記** — 直接傳一段話也可，當靈感卡片存
+- **多筆混合** — 一則訊息塞多個連結 + 一段文字，bot 一次處理完
+
+**指令**：
+- `/start` — 開機問候
+- `/stats` — 看 Notion 收藏數
+- `/recent` — 最近 5 筆
+- `/usage` — 查 Railway 本月用量 + 餘額
+
+> Threads 在 2025 後期改成 server-side render + 未登入空殼，要爬完整資料需要登入 cookie，請見 `threads-bot/CLAUDE.md` 的 `THREADS_STATE_JSON` 設定。
 
 ### `xiaofa-bot/` — 小發自動發文
 - `bot.py` — 把任意文字／網址訊息丟進 Telegram，Claude 整理後寫進 Notion。

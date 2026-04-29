@@ -26,6 +26,30 @@
 
 ---
 
+### 從 Threads / IG / FB 收藏夾自動同步
+
+**動機**：與其手動把每個貼文連結轉給 bot，不如讓 bot 直接掃自己的收藏夾，找出新的、還沒進 Notion 的，自動處理。
+
+**做法**（要 cookie 法先做完）：
+1. 用 Playwright + 登入 cookie 開 `https://www.threads.com/@me/saved`（或 IG/FB 對應 saved page）
+2. 模擬滾動載入所有貼文連結
+3. 跟 Notion 既有資料比對，找出新的
+4. 一個一個跑現有 `_process_one()` 邏輯
+
+**指令設計**：
+- `/sync threads` — 同步 Threads 收藏
+- `/sync ig` — 同步 Instagram 收藏
+- `/sync fb` — 同步 Facebook 收藏
+- `/sync telegram` — 掃 Telegram「儲存的訊息」中的連結（**最安全的版本，不需登入 IG**）
+
+**風險與注意**：
+- IG / Threads 對 DM 自動化偵測敏感，**不要碰 DM**
+- 收藏夾相對安全（讀自己已經收藏的資料）
+- 加 rate limit（同步時逐則處理，避免短時間大量爬蟲）
+- 推薦先做 Telegram Saved Messages 版本（風險為 0、UX 還可以）
+
+---
+
 ## 🟢 想到再做
 
 - [ ] xiaofa-bot 也接 Infisical（目前只有本機 .env）

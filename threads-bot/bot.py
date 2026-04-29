@@ -576,6 +576,92 @@ async def handle_message(update: Update, _: ContextTypes.DEFAULT_TYPE):
     await msg.edit_text("完成！\n\n" + "\n\n".join(results), disable_web_page_preview=True)
 
 
+RAILWAY_API_TOKEN = os.environ.get("RAILWAY_API_TOKEN")
+RAILWAY_GRAPHQL = "https://backboard.railway.com/graphql/v2"
+
+
+def _query_railway(query: str, variables: dict | None = None) -> dict:
+    import requests as _requests
+    res = _requests.post(
+        RAILWAY_GRAPHQL,
+        json={"query": query, "variables": variables or {}},
+        headers={"Authorization": f"Bearer {RAILWAY_API_TOKEN}"},
+        timeout=15,
+    )
+    res.raise_for_status()
+    payload = res.json()
+    if payload.get("errors"):
+        raise RuntimeError(f"Railway GraphQL errors: {payload['errors']}")
+    return payload.get("data", {})
+
+
+def get_railway_usage() -> dict:
+    if not RAILWAY_API_TOKEN:
+        return {"error": "RAILWAY_API_TOKEN 未設"}
+    try:
+        from datetime import datetime, timezone
+        me_data = _query_railway("query { me { id email workspaces { id name } } }")
+        workspaces = me_data.get("me", {}).get("workspaces", []) or []
+        if not workspaces:
+            return {"error": "找不到 workspace"}
+        ws = workspaces[0]
+        ws_id = ws["id"]
+
+        now = datetime.now(timezone.utc)
+        start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+
+        usage_query = """
+        query usage($workspaceId: String!, $startDate: DateTime!, $endDate: DateTime!, $measurements: [MetricMeasurement!]!) {
+            usage(workspaceId: $workspaceId, startDate: $startDate, endDate: $endDate, measurements: $measurements) {
+                measurement
+                value
+            }
+        }
+        """
+        usage_data = _query_railway(usage_query, {
+            "workspaceId": ws_id,
+            "startDate": start.isoformat(),
+            "endDate": now.isoformat(),
+            "measurements": ["ESTIMATED_USAGE"],
+        })
+        items = usage_data.get("usage", []) or []
+        cost = sum(float(i.get("value") or 0) for i in items if i.get("measurement") == "ESTIMATED_USAGE")
+        return {
+            "workspace": ws.get("name", "?"),
+            "estimated_cost": cost,
+            "period_start": start.strftime("%Y-%m-%d"),
+            "now": now.strftime("%Y-%m-%d %H:%M UTC"),
+        }
+    except Exception as e:
+        log.exception("Railway usage 查詢失敗")
+        return {"error": f"{type(e).__name__}: {e}"}
+
+
+async def usage_cmd(update: Update, _: ContextTypes.DEFAULT_TYPE):
+    if not _allowed(update):
+        await update.message.reply_text("⛔ 沒有權限")
+        return
+    await update.message.reply_text("⏳ 查 Railway 用量...")
+    result = await asyncio.to_thread(get_railway_usage)
+    if "error" in result:
+        await update.message.reply_text(f"❌ {result['error']}")
+        return
+    cost = result["estimated_cost"]
+    free = 5.00
+    remaining = max(0.0, free - cost)
+    bar_full = int(min(cost / free, 1.0) * 10)
+    bar = "▰" * bar_full + "▱" * (10 - bar_full)
+    msg = (
+        f"📊 Railway 用量（{result['workspace']}）\n"
+        f"━━━━━━━━━━━━━━━━\n"
+        f"期間：{result['period_start']} ~ 今\n"
+        f"已用：${cost:.2f}\n"
+        f"剩餘：${remaining:.2f} / $5.00\n"
+        f"{bar}  {cost / free * 100:.1f}%"
+    )
+    await update.message.reply_text(msg)
+
+
 async def _shutdown_browser(_app):
     global _browser, _playwright
     if _browser:
@@ -596,6 +682,7 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("stats", stats))
     app.add_handler(CommandHandler("recent", recent))
+    app.add_handler(CommandHandler("usage", usage_cmd))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     log.info("靈感收集機器人 啟動中...")
     app.run_polling()
