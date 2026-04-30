@@ -74,6 +74,97 @@ flowchart LR
 兩個專案各自 `cp .env.example .env` 後填入金鑰，然後 `pip install -r requirements.txt`。
 詳細步驟看各子目錄的 README / CLAUDE.md / 部署文件。
 
+---
+
+## ⚙️ 技術細節（給想深挖的人）
+
+<details>
+<summary><b>環境變數完整清單</b></summary>
+
+#### 必填
+| 變數 | 用途 | 從哪拿 |
+|---|---|---|
+| `TELEGRAM_TOKEN` | Bot 認證 | @BotFather `/newbot` |
+| `NOTION_TOKEN` | Notion API 認證 | notion.so/profile/integrations |
+| `NOTION_DATABASE_ID` | 目標 DB | DB URL 中間 32 位 |
+| `ANTHROPIC_API_KEY` | Claude API | console.anthropic.com |
+| `ALLOWED_USER_ID` | 限制誰可以呼叫 | @userinfobot |
+
+#### 選填
+| 變數 | 啟用什麼 |
+|---|---|
+| `THREADS_STATE_JSON` | 登入後爬完整 Threads 內容（跑 `get_cookies.py` 產生） |
+| `INGEST_SECRET` | HTTP `/ingest` webhook 認證 |
+| `RAILWAY_API_TOKEN` | `/usage` 指令查 Railway 用量 |
+| `AUTO_SYNC_HOURS` | 排程同步間隔（小時，0 = 關閉） |
+| `AUTO_SYNC_MAX` | 每次排程最多處理幾則（預設 20） |
+
+</details>
+
+<details>
+<summary><b>HTTP /ingest Webhook API（給 iOS Shortcut / curl / n8n 用）</b></summary>
+
+繞過 Telegram，直接 POST URL 進來自動處理。
+
+**Endpoint**: `POST https://your-railway-domain.up.railway.app/ingest`
+
+**Headers**:
+- `X-Auth-Secret: <你的 INGEST_SECRET>`（必填）
+- `Content-Type: application/json` 或 `application/x-www-form-urlencoded`
+
+**Body**（JSON 或 form 或 query string 三選一）：
+- JSON: `{"url": "https://..."}`
+- Form: `url=https://...`
+- Query: `?url=https://...`
+
+**Response**: `200 {"status":"queued","url":"..."}` 或 `401 Unauthorized`
+
+webhook 會非同步觸發處理，完成後傳 Telegram 訊息給 `ALLOWED_USER_ID` 報告結果。
+
+</details>
+
+<details>
+<summary><b>Threads 爬蟲 fallback 鏈</b></summary>
+
+Threads 在 2025 後期把資料藏到登入後 client-side fetch，未登入訪客拿到的 HTML 是空殼。爬蟲走多層 fallback：
+
+1. **GraphQL 攔截** — Playwright `page.on("response")` 截 `/graphql/query` response → jmespath 解析 `thread_items`
+2. **HTML `<script data-sjs>`** — 改版後資料藏在 server-side render 的 script tag → nested_lookup 找 `thread_items`
+3. **HTML script tag 鬆綁** — 找任何含 `caption` + `user.username` 的 dict
+4. **Open Graph meta** — `<meta property="og:description">` 摘要
+5. **regex `"caption":{"text":"..."}` 直接撈** — 最後手段
+
+只要設了 `THREADS_STATE_JSON`，第 1-3 層都會生效（含登入身份能拿完整資料）。沒設只會走 4-5 層（只能拿到摘要程度的資料）。
+
+</details>
+
+<details>
+<summary><b>部署到 Railway 步驟</b></summary>
+
+1. Fork / clone 這個 repo 到你 GitHub
+2. Railway → New Project → Deploy from GitHub repo
+3. Service Settings → **Root Directory** 設 `threads-bot`（mono-repo 必要）
+4. 在 Railway Variables 加環境變數（或接 Infisical 自動同步）
+5. 第一次 build 約 5-8 分鐘（Playwright base image 較大）
+6. ACTIVE 後對 bot 傳 `/start` 測試
+7. 想開放 webhook → Settings → Networking → Generate Domain（拿到公網 URL）
+
+</details>
+
+<details>
+<summary><b>自動同步排程細節</b></summary>
+
+用 `python-telegram-bot[job-queue]` 的 JobQueue（背後是 APScheduler）：
+- 啟動 5 分鐘後跑第一次（讓 bot 先 warm up）
+- 之後每 `AUTO_SYNC_HOURS` 小時跑一次
+- 每次最多處理 `AUTO_SYNC_MAX` 則（預設 20）
+- 每則處理加 90 秒 timeout，避免單則卡死整個批次
+- Cookie 過期會發 Telegram 通知，不會靜默失敗
+
+實作位置：`threads-bot/bot.py` 的 `_scheduled_sync_job` 函數。
+
+</details>
+
 ## 📝 想看實作筆記？
 
 - [JOURNEY.md](JOURNEY.md) — 這個專案怎麼從「亂寫的 bot」長成這樣，每個轉折我在想什麼
