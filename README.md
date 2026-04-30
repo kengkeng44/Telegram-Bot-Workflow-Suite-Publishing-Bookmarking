@@ -53,6 +53,9 @@ flowchart LR
 - `/stats` — 看 Notion 收藏數
 - `/recent` — 最近 5 筆
 - `/usage` — 查 Railway 本月用量 + 餘額
+- `/sync threads [N|all]` — 從 Threads 收藏夾批次抓新貼文（預設 5、`all` 全跑）
+
+**自動同步（選用）**：設 `AUTO_SYNC_HOURS=6` 後，bot 每 6 小時自己掃 Threads 收藏夾，找新的自動處理 — 連手動分享都不用了。
 
 > Threads 在 2025 後期改成 server-side render + 未登入空殼，要爬完整資料需要登入 cookie，請見 `threads-bot/CLAUDE.md` 的 `THREADS_STATE_JSON` 設定。
 
