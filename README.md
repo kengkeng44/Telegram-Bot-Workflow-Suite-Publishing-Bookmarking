@@ -1,21 +1,20 @@
-# Telegram Bot 工作流套件：自動化收藏 + AI 社群發文
+# Data Hoarder — Telegram Bot 自動收藏到 Notion
 
 > 🦝 **核心賣點：全自動。** 你在 Threads「按收藏」的貼文 → bot 每 6 小時自動爬下來 → Claude AI 整理成 Notion 卡片（摘要 / 分類 / 情緒 / 標籤 / 圖片）。**你只要按收藏，剩下都自動。**
 
-整合 **Telegram** 作為入口、**Claude AI** 做分析、**Notion** 做收納、**Threads** 做發布。為自己一個人的生產力打造，但 code、文件、踩坑歷程全公開。
+整合 **Telegram** 作為入口、**Claude AI** 做分析、**Notion** 做收納。為自己一個人的生產力打造，但 code、文件、踩坑歷程全公開。
 
 ## 🚀 核心功能
 * **🤖 全自動同步**（最大賣點）：bot 排程定期掃你 Threads 收藏夾，找新貼文自動爬 + AI 分析 + 進 Notion，**完全不用手動觸發**。
 * **📥 手動 / 分享觸發**：傳 URL 給 bot、用 iOS 分享、或呼叫 HTTP webhook，3 種方式都能進 Notion。
 * **🎯 多平台支援**：Threads / Instagram / Facebook / YouTube / Medium / 任何網頁、純文字筆記。
-* **🚀 AI 發布**：傳草稿給 xiaofa-bot，Claude 生成社群文案 → 一鍵同步至 Threads（持續擴充中）。
+* **🚀 AI 自動發文** — 開發中（會把 Notion 想法 / 草稿 → Claude 文案 → 自動發到 Threads）。
 
 ## 🛠️ 技術棧
 * **Language:** Python 3.12
-* **Framework:** Flask (Webhook 接收)
-* **AI Engine:** Claude API (Anthropic)
-* **Integrations:** Notion API, Threads Graph API, Telegram Bot API
-* **Infrastructure:** ngrok (Local Debug), Railway (Upcoming)
+* **AI Engine:** Claude API (Anthropic Haiku)
+* **Integrations:** Notion API, Telegram Bot API, Playwright
+* **Infrastructure:** Railway (24/7 部署), Infisical (secret 管理)
 
 ## 🗺️ 系統流程
 
@@ -38,15 +37,6 @@ flowchart LR
     SCRAPE --> CLAUDE1m[Claude Haiku]
     CLAUDE1m --> NOTION1m[(Notion Database)]
     NOTION1m -->|連結回覆| U
-```
-
-### Publisher（發文流）
-```mermaid
-flowchart LR
-    U[👤 使用者] -->|草稿/想法| TG2[Telegram Bot]
-    TG2 --> CLAUDE2[Claude<br/>產出社群文案]
-    CLAUDE2 --> THREADS[Threads Graph API]
-    THREADS -->|發文成功| U
 ```
 
 ## 📦 專案架構
@@ -74,10 +64,8 @@ flowchart LR
 
 > Threads 在 2025 後期改成 server-side render + 未登入空殼，要爬完整資料需要登入 cookie，請見 `threads-bot/CLAUDE.md` 的 `THREADS_STATE_JSON` 設定。
 
-### `xiaofa-bot/` — 小發自動發文
-- `bot.py` — 把任意文字／網址訊息丟進 Telegram，Claude 整理後寫進 Notion。
-- `xiaofa_bot.py` — 透過 Threads Graph API 直接發文到自己的 Threads。
-- `v2/` — 用 Render 部署（webhook 版）的版本，含 iOS 捷徑說明。
+### `xiaofa-bot/` — 自動發文（開發中）
+把 Notion 裡的想法、草稿透過 Claude 整理 → 自動發到 Threads。**目前還在開發中**，不是 production-ready，code 留著之後接回主流程。
 
 ## 使用前
 
