@@ -30,6 +30,8 @@ ALLOWED_USER_ID = int(os.environ.get("ALLOWED_USER_ID", "0"))
 THREADS_STATE_JSON = os.environ.get("THREADS_STATE_JSON")  # 可選：登入後的 storage_state JSON
 BOT_USER_ID = int(TELEGRAM_TOKEN.split(":")[0])  # bot 自己的 user id = token 冒號前的數字
 INGEST_SECRET = os.environ.get("INGEST_SECRET")  # webhook 認證用的 secret，不設則 webhook 不啟動
+AUTO_SYNC_HOURS = int(os.environ.get("AUTO_SYNC_HOURS", "0"))  # 排程同步間隔（小時），0 = 關閉
+AUTO_SYNC_MAX = int(os.environ.get("AUTO_SYNC_MAX", "20"))  # 每次排程同步最多處理幾則
 
 # ==== Clients & 共用狀態 ====
 notion = NotionClient(auth=NOTION_TOKEN)
@@ -909,6 +911,73 @@ async def sync_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(summary, disable_web_page_preview=True)
 
 
+# ==== 排程：自動 sync threads ====
+async def _scheduled_sync_job(context: ContextTypes.DEFAULT_TYPE):
+    """JobQueue 排程觸發，自動跑一次 /sync threads。"""
+    if not (ALLOWED_USER_ID and THREADS_STATE_JSON):
+        log.warning("[auto_sync] ALLOWED_USER_ID 或 THREADS_STATE_JSON 未設，跳過")
+        return
+    bot = context.bot
+    msg = await bot.send_message(chat_id=ALLOWED_USER_ID, text="🤖 排程：開始同步 Threads 收藏...")
+    try:
+        found = []
+        final_url = ""
+        for url in THREADS_SAVED_URLS:
+            try:
+                posts, final_url = await _fetch_saved_post_urls(url)
+                if posts:
+                    found = posts
+                    break
+            except Exception as e:
+                log.warning(f"[auto_sync] {url} 失敗: {e}")
+        if not found:
+            await msg.edit_text(f"🤖 排程：沒抓到貼文（cookie 可能過期）\nfinal URL: {final_url}")
+            return
+
+        cleaned = [_clean_url(u) for u in found]
+        existing = await asyncio.to_thread(_existing_urls_from_db)
+        new_urls = [u for u in cleaned if u not in existing]
+        if not new_urls:
+            await msg.edit_text(f"🤖 排程：{len(cleaned)} 則收藏，全部已在 Notion，無新增")
+            return
+
+        target = new_urls[:AUTO_SYNC_MAX]
+        await msg.edit_text(
+            f"🤖 排程：找到 {len(new_urls)} 則新貼文，處理 {len(target)} 則..."
+        )
+
+        success = skip = fail = 0
+        for url in target:
+            try:
+                async def _do():
+                    platform = detect_platform(url)
+                    scraped = await scrape_url(url, platform)
+                    return await _process_one({**scraped, "url": url, "platform": platform})
+                ok, _ = await asyncio.wait_for(_do(), timeout=90.0)
+                if ok:
+                    success += 1
+                else:
+                    skip += 1
+            except Exception:
+                fail += 1
+                log.exception("[auto_sync] %s 處理失敗", url)
+
+        summary = (
+            f"🤖 排程同步完成\n"
+            f"━━━━━━━━━━━━━━\n"
+            f"✅ 成功 {success}　⏭ 跳過 {skip}　❌ 失敗 {fail}"
+        )
+        if len(new_urls) > AUTO_SYNC_MAX:
+            summary += f"\n剩 {len(new_urls) - AUTO_SYNC_MAX} 則沒處理（下次再跑或手動 /sync threads all）"
+        await msg.edit_text(summary)
+    except Exception as e:
+        log.exception("[auto_sync] 排程失敗")
+        try:
+            await msg.edit_text(f"🤖 排程同步失敗：{type(e).__name__}: {e}")
+        except Exception:
+            pass
+
+
 # ==== HTTP Webhook（給 iOS Shortcut 等外部呼叫用）====
 _ptb_bot = None  # post_init 後填入，給 webhook handler 用
 
@@ -1011,6 +1080,16 @@ def main():
     app.add_handler(CommandHandler("recent", recent))
     app.add_handler(CommandHandler("usage", usage_cmd))
     app.add_handler(CommandHandler("sync", sync_cmd))
+
+    # 排程自動同步（如果 AUTO_SYNC_HOURS > 0）
+    if AUTO_SYNC_HOURS > 0 and app.job_queue:
+        app.job_queue.run_repeating(
+            _scheduled_sync_job,
+            interval=AUTO_SYNC_HOURS * 3600,
+            first=300,  # 啟動 5 分鐘後跑第一次
+            name="auto_sync_threads",
+        )
+        log.info(f"[main] 已註冊排程同步：每 {AUTO_SYNC_HOURS} 小時、每次最多 {AUTO_SYNC_MAX} 則")
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     log.info("靈感收集機器人 啟動中...")
     app.run_polling()
