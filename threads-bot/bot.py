@@ -1010,8 +1010,9 @@ async def _process_via_webhook(url: str):
 
 
 async def _ingest_handler(request: web.Request) -> web.Response:
+    import hmac
     secret = request.headers.get("X-Auth-Secret") or request.query.get("secret", "")
-    if not INGEST_SECRET or secret != INGEST_SECRET:
+    if not INGEST_SECRET or not hmac.compare_digest(secret, INGEST_SECRET):
         log.warning("[webhook] 401 from %s", request.remote)
         return web.Response(status=401, text="Unauthorized")
     url = request.query.get("url") or ""
