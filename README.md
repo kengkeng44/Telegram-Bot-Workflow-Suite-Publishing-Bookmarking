@@ -68,7 +68,8 @@ flowchart LR
 
 ## 📝 想看實作筆記？
 
-- [LESSONS.md](LESSONS.md) — 這個專案踩過的坑跟學到的事（secret 管理、爬蟲、雲端部署、防呆）
+- [JOURNEY.md](JOURNEY.md) — 這個專案怎麼從「亂寫的 bot」長成這樣，每個轉折我在想什麼
+- [LESSONS.md](LESSONS.md) — 客觀技術筆記（secret 管理、爬蟲、雲端部署、防呆）
 - [TODO.md](TODO.md) — 還沒做的改進跟想法
 
 ## 🔐 安全
