@@ -769,9 +769,22 @@ async def _ingest_handler(request: web.Request) -> web.Response:
         return web.Response(status=401, text="Unauthorized")
     url = request.query.get("url") or ""
     if request.method == "POST":
+        ctype = (request.content_type or "").lower()
         try:
-            body = await request.json()
-            url = body.get("url") or url
+            if "json" in ctype:
+                body = await request.json()
+                url = body.get("url") or url
+            elif "form" in ctype or "urlencoded" in ctype:
+                form = await request.post()
+                url = form.get("url") or url
+            else:
+                # 未指定 content-type：兩種都試
+                try:
+                    body = await request.json()
+                    url = body.get("url") or url
+                except Exception:
+                    form = await request.post()
+                    url = form.get("url") or url
         except Exception:
             pass
     if not url.startswith(("http://", "https://")):
