@@ -739,7 +739,7 @@ THREADS_SAVED_URLS = [
 
 
 async def _fetch_saved_post_urls(saved_page_url: str) -> tuple[list[str], str]:
-    """登入 cookie 開 saved page → 滾動載入 → 抽出所有貼文 URL。
+    """登入 cookie 開 saved page → 滾動載入直到沒新內容 → 抽出所有貼文 URL。
     回傳 (post_urls, final_url)。"""
     storage_state = json.loads(THREADS_STATE_JSON) if THREADS_STATE_JSON else None
     if not storage_state:
@@ -747,36 +747,44 @@ async def _fetch_saved_post_urls(saved_page_url: str) -> tuple[list[str], str]:
     browser = await _ensure_browser()
     context = await browser.new_context(user_agent=USER_AGENT, storage_state=storage_state)
     page = await context.new_page()
-    post_urls: list[str] = []
+    seen: set[str] = set()
     final_url = saved_page_url
     try:
         await page.goto(saved_page_url, wait_until="domcontentloaded", timeout=30000)
         final_url = page.url
         log.info(f"[sync_threads] saved 頁 final URL: {final_url}")
-        # 滾動 6 次載入更多
-        for _ in range(6):
-            await page.evaluate("window.scrollBy(0, document.body.scrollHeight)")
-            await asyncio.sleep(1.5)
-        html = await page.content()
-        log.info(f"[sync_threads] HTML 長度 {len(html)}")
-        seen = set()
-        # 抓相對連結 /@xxx/post/yyy（避開圖片、影片 path）
-        for m in re.finditer(r'/(@[\w.]+)/post/([\w-]+)', html):
-            user, post_id = m.group(1), m.group(2)
-            url = f"https://www.threads.com/{user}/post/{post_id}"
-            if url not in seen:
-                seen.add(url)
-                post_urls.append(url)
-        # 也抓絕對連結（上面 regex 不會吃絕對 URL 的 https:// 部分）
-        for m in re.finditer(r'https?://www\.threads\.(?:com|net)/(@[\w.]+)/post/([\w-]+)', html):
-            user, post_id = m.group(1), m.group(2)
-            url = f"https://www.threads.com/{user}/post/{post_id}"
-            if url not in seen:
-                seen.add(url)
-                post_urls.append(url)
+
+        def _scan_html(html: str):
+            for m in re.finditer(r'/(@[\w.]+)/post/([\w-]+)', html):
+                seen.add(f"https://www.threads.com/{m.group(1)}/post/{m.group(2)}")
+
+        # 初始 scan
+        _scan_html(await page.content())
+        log.info(f"[sync_threads] 初始載入: {len(seen)} 則")
+
+        # 持續滾動直到沒新內容（最多 80 次、連續 4 次沒新就停）
+        no_new_streak = 0
+        for i in range(1, 81):
+            prev_count = len(seen)
+            # 滾到底；用 wheel 比 evaluate 更接近真人行為，較容易 trigger lazy load
+            try:
+                await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+            except Exception:
+                pass
+            await asyncio.sleep(2.0)
+            _scan_html(await page.content())
+            delta = len(seen) - prev_count
+            log.info(f"[sync_threads] 滾動 {i}: +{delta}, 累計 {len(seen)}")
+            if delta == 0:
+                no_new_streak += 1
+                if no_new_streak >= 4:
+                    log.info(f"[sync_threads] 連續 4 次沒新貼文，停止滾動")
+                    break
+            else:
+                no_new_streak = 0
     finally:
         await context.close()
-    return post_urls, final_url
+    return list(seen), final_url
 
 
 async def sync_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -831,13 +839,18 @@ async def sync_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     existing = await asyncio.to_thread(_existing_urls_from_db)
     new_urls = [u for u in cleaned if u not in existing]
     if not new_urls:
-        await msg.edit_text(f"✅ 收藏夾找到 {len(cleaned)} 則，全部都已存在 Notion，沒有新的")
+        await msg.edit_text(
+            f"✅ 收藏夾找到 {len(cleaned)} 則，全部已存在 Notion\n"
+            f"📍 final URL: {final_url}\n"
+            f"💡 如果數量明顯比實際少，可能是 saved 頁被導去首頁（cookie 過期或 URL 路徑錯）"
+        )
         return
 
     target_list = new_urls[:max_count]
     total = len(target_list)
     await msg.edit_text(
         f"📥 收藏夾找到 {len(cleaned)} 則貼文，{len(new_urls)} 則尚未進 Notion\n"
+        f"📍 final URL: {final_url}\n"
         f"⏳ 開始處理 {total} 則（每則約 10–20 秒）..."
     )
 
