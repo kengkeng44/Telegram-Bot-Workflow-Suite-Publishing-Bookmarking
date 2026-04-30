@@ -1,10 +1,14 @@
 # Telegram Bot 工作流套件：自動化收藏 + AI 社群發文
 
-這是一個為個人生產力打造的自動化系統。整合了 **Telegram** 作為入口，利用 **Claude AI** 進行分析與文案生成，並將資料流轉至 **Notion** 歸檔與 **Threads** 自動發布。
+> 🦝 **核心賣點：全自動。** 你在 Threads「按收藏」的貼文 → bot 每 6 小時自動爬下來 → Claude AI 整理成 Notion 卡片（摘要 / 分類 / 情緒 / 標籤 / 圖片）。**你只要按收藏，剩下都自動。**
+
+整合 **Telegram** 作為入口、**Claude AI** 做分析、**Notion** 做收納、**Threads** 做發布。為自己一個人的生產力打造，但 code、文件、踩坑歷程全公開。
 
 ## 🚀 核心功能
-* **智能收藏 (Collector):** 透過 Telegram 分享連結或截圖，系統自動分析內容並標籤化存入 Notion。
-* **AI 創作發布 (Publisher):** 傳送簡單草稿，由 AI 生成社群風格文案並一鍵同步至 Threads（持續擴充中）。
+* **🤖 全自動同步**（最大賣點）：bot 排程定期掃你 Threads 收藏夾，找新貼文自動爬 + AI 分析 + 進 Notion，**完全不用手動觸發**。
+* **📥 手動 / 分享觸發**：傳 URL 給 bot、用 iOS 分享、或呼叫 HTTP webhook，3 種方式都能進 Notion。
+* **🎯 多平台支援**：Threads / Instagram / Facebook / YouTube / Medium / 任何網頁、純文字筆記。
+* **🚀 AI 發布**：傳草稿給 xiaofa-bot，Claude 生成社群文案 → 一鍵同步至 Threads（持續擴充中）。
 
 ## 🛠️ 技術棧
 * **Language:** Python 3.12
@@ -15,14 +19,25 @@
 
 ## 🗺️ 系統流程
 
-### Collector（收藏流）
+### 🤖 全自動模式（推薦，零按鍵）
 ```mermaid
 flowchart LR
-    U[👤 使用者] -->|貼 Threads 連結| TG1[Telegram Bot]
-    TG1 --> SCRAPE[Playwright 爬 GraphQL]
-    SCRAPE --> CLAUDE1[Claude Haiku<br/>摘要/分類/情緒/標籤]
+    U[👤 你] -->|按收藏| THREADS_FAV[Threads 收藏夾]
+    SCHED[⏰ 每 6 小時排程] --> SYNC[bot 自動掃 saved]
+    THREADS_FAV --> SYNC
+    SYNC --> CLAUDE1[Claude Haiku<br/>摘要/分類/情緒/標籤]
     CLAUDE1 --> NOTION1[(Notion Database)]
-    NOTION1 -->|連結回覆| U
+    NOTION1 -.->|完成通知| U
+```
+
+### 📥 手動模式（分享或傳訊）
+```mermaid
+flowchart LR
+    U[👤 你] -->|分享 / 傳 URL| TG1[Telegram Bot]
+    TG1 --> SCRAPE[Playwright 爬 GraphQL]
+    SCRAPE --> CLAUDE1m[Claude Haiku]
+    CLAUDE1m --> NOTION1m[(Notion Database)]
+    NOTION1m -->|連結回覆| U
 ```
 
 ### Publisher（發文流）
@@ -48,14 +63,14 @@ flowchart LR
 - **純文字筆記** — 直接傳一段話也可，當靈感卡片存
 - **多筆混合** — 一則訊息塞多個連結 + 一段文字，bot 一次處理完
 
+**🤖 全自動同步（核心功能）**：設 `AUTO_SYNC_HOURS=6` 後，bot 每 6 小時自己掃 Threads 收藏夾，找新的貼文自動處理進 Notion — **連手動分享都不用了**。
+
 **指令**：
+- `/sync threads [N|all]` — 手動跑一次同步收藏夾（自動模式之外，想立刻同步用）
 - `/start` — 開機問候
 - `/stats` — 看 Notion 收藏數
 - `/recent` — 最近 5 筆
 - `/usage` — 查 Railway 本月用量 + 餘額
-- `/sync threads [N|all]` — 從 Threads 收藏夾批次抓新貼文（預設 5、`all` 全跑）
-
-**自動同步（選用）**：設 `AUTO_SYNC_HOURS=6` 後，bot 每 6 小時自己掃 Threads 收藏夾，找新的自動處理 — 連手動分享都不用了。
 
 > Threads 在 2025 後期改成 server-side render + 未登入空殼，要爬完整資料需要登入 cookie，請見 `threads-bot/CLAUDE.md` 的 `THREADS_STATE_JSON` 設定。
 
