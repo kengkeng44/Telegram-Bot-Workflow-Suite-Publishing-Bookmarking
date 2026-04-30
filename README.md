@@ -1,6 +1,6 @@
 # Data Hoarder — Telegram Bot 自動收藏到 Notion
 
-> 🦝 **核心賣點：全自動。** 你在 Threads「按收藏」的貼文 → bot 每 6 小時自動爬下來 → Claude AI 整理成 Notion 卡片（摘要 / 分類 / 情緒 / 標籤 / 圖片）。**你只要按收藏，剩下都自動。**
+> 🦝 **核心賣點：全自動。** 你在 Threads「按收藏」的貼文 → bot 每 6 小時自動爬下來 → Claude AI 整理成 Notion 卡片（摘要 / 分類 / 標籤 / 原文金句 / 圖片）。**你只要按收藏，剩下都自動。**
 
 整合 **Telegram** 作為入口、**Claude AI** 做分析、**Notion** 做收納。為自己一個人的生產力打造，但 code、文件、踩坑歷程全公開。
 
@@ -24,7 +24,7 @@ flowchart LR
     U[👤 你] -->|按收藏| THREADS_FAV[Threads 收藏夾]
     SCHED[⏰ 每 6 小時排程] --> SYNC[bot 自動掃 saved]
     THREADS_FAV --> SYNC
-    SYNC --> CLAUDE1[Claude Haiku<br/>摘要/分類/情緒/標籤]
+    SYNC --> CLAUDE1[Claude Haiku<br/>摘要/分類/標籤/金句]
     CLAUDE1 --> NOTION1[(Notion Database)]
     NOTION1 -.->|完成通知| U
 ```
@@ -45,7 +45,7 @@ flowchart LR
 
 > 📦 資料夾還叫 `threads-bot/`（歷史包袱），實際用途是「多平台收藏 bot」，故對外暱稱 **Data Hoarder**。資料夾改名要協調 Railway Root Directory，已記在 [TODO.md](TODO.md) 之後再做。
 
-傳任何網址或文字給 Telegram bot，自動爬內容（Playwright）→ Claude 分析（摘要／分類／情緒／標籤）→ 寫入 Notion Database。
+傳任何網址或文字給 Telegram bot，自動爬內容（Playwright）→ Claude 分析（摘要／分類／標籤／原文金句）→ 寫入 Notion Database。
 
 **支援來源**：
 - **Threads**（自家 + 別人公開貼文）— 走專用 GraphQL / `data-sjs` script tag 解析
