@@ -780,18 +780,29 @@ async def _fetch_saved_post_urls(saved_page_url: str) -> tuple[list[str], str]:
 
 
 async def sync_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """
+    /sync threads          → 預設 5 則
+    /sync threads all      → 全部新的
+    /sync threads 30       → 自訂上限
+    """
     if not _allowed(update):
         await update.message.reply_text("⛔ 沒有權限")
         return
     args = ctx.args or []
     target = (args[0].lower() if args else "threads")
-    max_count = 5
-    if len(args) >= 2 and args[1].isdigit():
-        max_count = max(1, min(20, int(args[1])))
-
     if target != "threads":
-        await update.message.reply_text("目前只支援 `/sync threads [n]`，n 預設 5、最多 20")
+        await update.message.reply_text("目前只支援 `/sync threads [N|all]`")
         return
+
+    if len(args) >= 2:
+        if args[1].lower() == "all":
+            max_count = 9999
+        elif args[1].isdigit():
+            max_count = max(1, int(args[1]))
+        else:
+            max_count = 5
+    else:
+        max_count = 5
 
     msg = await update.message.reply_text("⏳ 開啟 Threads 收藏夾...")
     found: list[str] = []
@@ -812,41 +823,65 @@ async def sync_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await msg.edit_text(
             f"❌ 沒抓到任何貼文\n"
             f"final URL: {final_url}\n"
-            f"最後錯誤: {last_err}\n"
-            f"可能原因：(1) saved 頁 URL 路徑不對 (2) cookie 過期 (3) Threads 改版"
+            f"最後錯誤: {last_err}"
         )
         return
 
     cleaned = [_clean_url(u) for u in found]
     existing = await asyncio.to_thread(_existing_urls_from_db)
     new_urls = [u for u in cleaned if u not in existing]
-    await msg.edit_text(
-        f"📥 在收藏夾找到 {len(cleaned)} 則貼文\n"
-        f"  其中 {len(new_urls)} 則尚未進 Notion\n"
-        f"  ⏳ 處理前 {min(len(new_urls), max_count)} 則..."
-    )
     if not new_urls:
+        await msg.edit_text(f"✅ 收藏夾找到 {len(cleaned)} 則，全部都已存在 Notion，沒有新的")
         return
 
-    results = []
-    for i, url in enumerate(new_urls[:max_count], 1):
+    target_list = new_urls[:max_count]
+    total = len(target_list)
+    await msg.edit_text(
+        f"📥 收藏夾找到 {len(cleaned)} 則貼文，{len(new_urls)} 則尚未進 Notion\n"
+        f"⏳ 開始處理 {total} 則（每則約 10–20 秒）..."
+    )
+
+    success = skip = fail = 0
+    fail_samples: list[str] = []
+    for i, url in enumerate(target_list, 1):
         try:
             platform = detect_platform(url)
             scraped = await scrape_url(url, platform)
             source = {**scraped, "url": url, "platform": platform}
-            ok, line = await _process_one(source)
-            results.append(f"{i}/{min(len(new_urls), max_count)} {line}")
+            ok, _line = await _process_one(source)
+            if ok:
+                success += 1
+            else:
+                skip += 1
         except Exception as e:
+            fail += 1
             log.exception("[sync_threads] 處理 %s 失敗", url)
-            results.append(f"{i} ❌ {type(e).__name__}: {e}")
+            if len(fail_samples) < 3:
+                fail_samples.append(f"{url.split('/')[-1][:20]}: {type(e).__name__}")
 
-    summary = f"✅ 同步完成（處理 {len(results)} 則）"
-    if len(new_urls) > max_count:
-        summary += f"\n還剩 {len(new_urls) - max_count} 則新貼文，再傳 `/sync threads {min(20, len(new_urls) - max_count)}` 處理"
-    await update.message.reply_text(
-        summary + "\n\n" + "\n\n".join(results),
-        disable_web_page_preview=True,
+        # 每 3 則更新一次進度（避免 Telegram rate limit）
+        if i % 3 == 0 or i == total:
+            try:
+                await msg.edit_text(
+                    f"⏳ 進度 {i}/{total}\n"
+                    f"  ✅ {success}　⏭ {skip}　❌ {fail}"
+                )
+            except Exception:
+                pass
+
+    summary = (
+        f"✅ 同步完成\n"
+        f"━━━━━━━━━━━━━━\n"
+        f"已處理：{total} 則\n"
+        f"  ✅ 成功：{success}\n"
+        f"  ⏭ 沒抓到內容：{skip}\n"
+        f"  ❌ 失敗：{fail}"
     )
+    if fail_samples:
+        summary += "\n\n失敗範例：\n" + "\n".join(fail_samples)
+    if len(new_urls) > max_count:
+        summary += f"\n\n還剩 {len(new_urls) - max_count} 則沒處理，傳 `/sync threads all` 處理剩下的"
+    await update.message.reply_text(summary, disable_web_page_preview=True)
 
 
 # ==== HTTP Webhook（給 iOS Shortcut 等外部呼叫用）====
