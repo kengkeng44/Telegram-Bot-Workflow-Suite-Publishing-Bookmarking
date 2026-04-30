@@ -856,16 +856,28 @@ async def sync_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     success = skip = fail = 0
     fail_samples: list[str] = []
+
+    async def _process_url_with_timeout(u: str):
+        platform = detect_platform(u)
+        scraped = await scrape_url(u, platform)
+        source = {**scraped, "url": u, "platform": platform}
+        return await _process_one(source)
+
     for i, url in enumerate(target_list, 1):
+        log.info(f"[sync_threads] 處理 {i}/{total}: {url}")
         try:
-            platform = detect_platform(url)
-            scraped = await scrape_url(url, platform)
-            source = {**scraped, "url": url, "platform": platform}
-            ok, _line = await _process_one(source)
+            ok, _line = await asyncio.wait_for(
+                _process_url_with_timeout(url), timeout=90.0
+            )
             if ok:
                 success += 1
             else:
                 skip += 1
+        except asyncio.TimeoutError:
+            fail += 1
+            log.warning(f"[sync_threads] 超時跳過: {url}")
+            if len(fail_samples) < 3:
+                fail_samples.append(f"{url.split('/')[-1][:20]}: Timeout 90s")
         except Exception as e:
             fail += 1
             log.exception("[sync_threads] 處理 %s 失敗", url)
