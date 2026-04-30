@@ -731,6 +731,124 @@ async def usage_cmd(update: Update, _: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(msg, disable_web_page_preview=True)
 
 
+# ==== /sync 同步 Threads 收藏夾 ====
+THREADS_SAVED_URLS = [
+    "https://www.threads.com/saved",
+    "https://www.threads.net/saved",
+]
+
+
+async def _fetch_saved_post_urls(saved_page_url: str) -> tuple[list[str], str]:
+    """登入 cookie 開 saved page → 滾動載入 → 抽出所有貼文 URL。
+    回傳 (post_urls, final_url)。"""
+    storage_state = json.loads(THREADS_STATE_JSON) if THREADS_STATE_JSON else None
+    if not storage_state:
+        raise RuntimeError("THREADS_STATE_JSON 未設，先跑 python get_cookies.py 產生")
+    browser = await _ensure_browser()
+    context = await browser.new_context(user_agent=USER_AGENT, storage_state=storage_state)
+    page = await context.new_page()
+    post_urls: list[str] = []
+    final_url = saved_page_url
+    try:
+        await page.goto(saved_page_url, wait_until="domcontentloaded", timeout=30000)
+        final_url = page.url
+        log.info(f"[sync_threads] saved 頁 final URL: {final_url}")
+        # 滾動 6 次載入更多
+        for _ in range(6):
+            await page.evaluate("window.scrollBy(0, document.body.scrollHeight)")
+            await asyncio.sleep(1.5)
+        html = await page.content()
+        log.info(f"[sync_threads] HTML 長度 {len(html)}")
+        seen = set()
+        # 抓相對連結 /@xxx/post/yyy（避開圖片、影片 path）
+        for m in re.finditer(r'/(@[\w.]+)/post/([\w-]+)', html):
+            user, post_id = m.group(1), m.group(2)
+            url = f"https://www.threads.com/{user}/post/{post_id}"
+            if url not in seen:
+                seen.add(url)
+                post_urls.append(url)
+        # 也抓絕對連結（上面 regex 不會吃絕對 URL 的 https:// 部分）
+        for m in re.finditer(r'https?://www\.threads\.(?:com|net)/(@[\w.]+)/post/([\w-]+)', html):
+            user, post_id = m.group(1), m.group(2)
+            url = f"https://www.threads.com/{user}/post/{post_id}"
+            if url not in seen:
+                seen.add(url)
+                post_urls.append(url)
+    finally:
+        await context.close()
+    return post_urls, final_url
+
+
+async def sync_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not _allowed(update):
+        await update.message.reply_text("⛔ 沒有權限")
+        return
+    args = ctx.args or []
+    target = (args[0].lower() if args else "threads")
+    max_count = 5
+    if len(args) >= 2 and args[1].isdigit():
+        max_count = max(1, min(20, int(args[1])))
+
+    if target != "threads":
+        await update.message.reply_text("目前只支援 `/sync threads [n]`，n 預設 5、最多 20")
+        return
+
+    msg = await update.message.reply_text("⏳ 開啟 Threads 收藏夾...")
+    found: list[str] = []
+    final_url = ""
+    last_err = ""
+    for url in THREADS_SAVED_URLS:
+        try:
+            posts, final_url = await _fetch_saved_post_urls(url)
+            if posts:
+                found = posts
+                break
+        except Exception as e:
+            last_err = f"{type(e).__name__}: {e}"
+            log.warning(f"[sync_threads] 嘗試 {url} 失敗: {e}")
+            continue
+
+    if not found:
+        await msg.edit_text(
+            f"❌ 沒抓到任何貼文\n"
+            f"final URL: {final_url}\n"
+            f"最後錯誤: {last_err}\n"
+            f"可能原因：(1) saved 頁 URL 路徑不對 (2) cookie 過期 (3) Threads 改版"
+        )
+        return
+
+    cleaned = [_clean_url(u) for u in found]
+    existing = await asyncio.to_thread(_existing_urls_from_db)
+    new_urls = [u for u in cleaned if u not in existing]
+    await msg.edit_text(
+        f"📥 在收藏夾找到 {len(cleaned)} 則貼文\n"
+        f"  其中 {len(new_urls)} 則尚未進 Notion\n"
+        f"  ⏳ 處理前 {min(len(new_urls), max_count)} 則..."
+    )
+    if not new_urls:
+        return
+
+    results = []
+    for i, url in enumerate(new_urls[:max_count], 1):
+        try:
+            platform = detect_platform(url)
+            scraped = await scrape_url(url, platform)
+            source = {**scraped, "url": url, "platform": platform}
+            ok, line = await _process_one(source)
+            results.append(f"{i}/{min(len(new_urls), max_count)} {line}")
+        except Exception as e:
+            log.exception("[sync_threads] 處理 %s 失敗", url)
+            results.append(f"{i} ❌ {type(e).__name__}: {e}")
+
+    summary = f"✅ 同步完成（處理 {len(results)} 則）"
+    if len(new_urls) > max_count:
+        summary += f"\n還剩 {len(new_urls) - max_count} 則新貼文，再傳 `/sync threads {min(20, len(new_urls) - max_count)}` 處理"
+    await update.message.reply_text(
+        summary + "\n\n" + "\n\n".join(results),
+        disable_web_page_preview=True,
+    )
+
+
 # ==== HTTP Webhook（給 iOS Shortcut 等外部呼叫用）====
 _ptb_bot = None  # post_init 後填入，給 webhook handler 用
 
@@ -832,6 +950,7 @@ def main():
     app.add_handler(CommandHandler("stats", stats))
     app.add_handler(CommandHandler("recent", recent))
     app.add_handler(CommandHandler("usage", usage_cmd))
+    app.add_handler(CommandHandler("sync", sync_cmd))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     log.info("靈感收集機器人 啟動中...")
     app.run_polling()
