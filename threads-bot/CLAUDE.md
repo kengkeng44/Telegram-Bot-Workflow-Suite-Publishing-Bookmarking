@@ -147,9 +147,23 @@ re.search(r'"caption":\{"text":"([^"]+)"', html)
 
 **圖片解析**：`_extract_image_urls()` 從 `image_versions2.candidates[0]`（Threads 預設第一個是最大張）抓單張，再從 `carousel_media[*]` 抓多圖貼文，去重後回傳。HTML 備援不取圖。
 
-### analyze_with_claude(text) — AI 分析
+### analyze_with_claude(text, platform, fallback_author, media_blocks) — AI 多模態分析
 
-**模型**：`claude-haiku-4-5-20251001`（速度快、便宜，分類任務夠用）
+**模型（依有無視覺自動切換）**：
+- 純文字 → `MODEL_TEXT = claude-haiku-4-5`（快、便宜）
+- 有圖片 / 影片影格 → `MODEL_VISION = claude-sonnet-4-6`（看圖理解力佳，仍便宜）
+
+**多模態**：`media_blocks` 是預先準備好的 image content blocks（base64）。`collect_media_blocks(source)` 負責蒐集：
+- `image_urls` → httpx 下載 → base64（最多 `MAX_IMAGES=4` 張）
+- `local_image_paths` → 讀本地檔（Telegram 直接傳圖）
+- `video_urls` → 下載 → `extract_video_frames()` 用 ffmpeg 場景偵測抽影格
+- `local_video_paths` → 同上（Telegram 直接傳影片 / IG Reel）
+
+**影片抽影格**：`extract_video_frames()` 先用 ffmpeg 場景偵測（`select=gt(scene,0.3)`）抽轉場影格，抽不到（短片/無轉場）退回 `fps=1` 均勻取樣；縮到 `VIDEO_FRAME_WIDTH=640`、壓在 `VIDEO_MAX_FRAMES=12` 張內。需要系統有 `ffmpeg`（Dockerfile 已 apt 安裝）。
+
+**Google 地圖**：prompt 多要一個 `place` 欄位，Claude 從文字/畫面（招牌、店名）認出實體地點時填店名/地名；`maps_url(place)` 組免費搜尋連結（不需 API key），`write_to_notion` 以 bookmark block 附到 page。
+
+**舊版相容**：`claude-haiku-4-5-20251001`（速度快、便宜，分類任務夠用）
 
 **Prompt** 要求回傳純 JSON（不含 markdown fence）：
 ```json

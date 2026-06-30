@@ -8,7 +8,9 @@
 
 ## 🚀 核心功能
 * **🤖 全自動同步**（最大賣點）：bot 排程定期掃你 Threads 收藏夾，找新貼文自動爬 + AI 分析 + 進 Notion，**完全不用手動觸發**。
-* **📥 手動 / 分享觸發**：傳 URL 給 bot、用 iOS 分享、或呼叫 HTTP webhook，3 種方式都能進 Notion。
+* **🖼 多模態分析**：圖片用 Claude 直接「看圖」、影片 / IG Reel 自動用 ffmpeg 抽影格看畫面（不只看 caption）。傳圖片 / 影片給 bot 也能直接分析。
+* **🗺️ 自動附 Google 地圖**：內容是餐廳 / 店家 / 景點時，Claude 認出地點，自動附上 Google 地圖連結進 Notion。
+* **📥 手動 / 分享觸發**：傳 URL / 圖片 / 影片給 bot、用 iOS 分享、或呼叫 HTTP webhook，都能進 Notion。
 * **🎯 多平台支援**：Threads / Instagram / Facebook / YouTube / Medium / 任何網頁、純文字筆記。
 * **🚀 AI 自動發文** — 開發中（會把 Notion 想法 / 草稿 → Claude 文案 → 自動發到 Threads）。
 

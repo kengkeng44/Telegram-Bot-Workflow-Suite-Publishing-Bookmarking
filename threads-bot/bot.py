@@ -7,10 +7,15 @@
 import os
 import re
 import json
-import logging
+import base64
+import shutil
 import asyncio
+import logging
+import tempfile
+import subprocess
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
+from urllib.parse import quote_plus
 
 from telegram import Update
 from telegram.ext import Application, MessageHandler, CommandHandler, filters, ContextTypes
@@ -38,6 +43,15 @@ notion = NotionClient(auth=NOTION_TOKEN)
 claude = Anthropic(api_key=ANTHROPIC_API_KEY)
 TZ_TAIPEI = timezone(timedelta(hours=8))
 CATEGORIES = ["AI科技", "生活風格", "學習成長", "設計創意"]
+
+# ==== 多模態（圖片 / 影片）設定 ====
+MODEL_TEXT = "claude-haiku-4-5"        # 純文字：便宜快
+MODEL_VISION = "claude-sonnet-4-6"     # 有圖片 / 影格：看圖理解力佳，仍便宜
+MAX_IMAGES = 4                          # 一則最多送幾張原圖給 Claude
+VIDEO_MAX_FRAMES = 12                   # 一支影片最多抽幾張影格
+VIDEO_FRAME_WIDTH = 640                 # 影格縮放寬度（高度等比；512~768 是 LLM 視覺甜蜜點）
+VIDEO_SCENE_THRESHOLD = 0.3            # ffmpeg 場景偵測閾值（轉場才抽，比固定間隔聰明）
+FFMPEG_BIN = shutil.which("ffmpeg") or "ffmpeg"
 USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -101,6 +115,18 @@ def _extract_image_urls(node: dict) -> list[str]:
     if single:
         urls.append(single)
     for u in (jmespath.search("carousel_media[*].image_versions2.candidates[0].url", node) or []):
+        if u and u not in urls:
+            urls.append(u)
+    return urls
+
+
+def _extract_video_urls(node: dict) -> list[str]:
+    """Threads/IG GraphQL node 的影片網址（單片 video_versions + 輪播）。"""
+    urls = []
+    single = jmespath.search("video_versions[0].url", node)
+    if single:
+        urls.append(single)
+    for u in (jmespath.search("carousel_media[*].video_versions[0].url", node) or []):
         if u and u not in urls:
             urls.append(u)
     return urls
@@ -249,6 +275,7 @@ async def _scrape_threads(url: str) -> dict:
                 "text": (node.get("caption") or {}).get("text", ""),
                 "author": node.get("user", {}).get("username", ""),
                 "image_urls": _extract_image_urls(node),
+                "video_urls": _extract_video_urls(node),
             }
 
     if captured:
@@ -265,6 +292,7 @@ async def _scrape_threads(url: str) -> dict:
             "text": (post_node.get("caption") or {}).get("text", ""),
             "author": post_node.get("user", {}).get("username", ""),
             "image_urls": _extract_image_urls(post_node),
+            "video_urls": _extract_video_urls(post_node),
         }
 
     match = re.search(r'"caption":\{"text":"([^"]+)"', html)
@@ -301,16 +329,21 @@ async def _scrape_generic(url: str) -> dict:
                 description: get('meta[property="og:description"]') || get('meta[name="description"]'),
                 site_name: get('meta[property="og:site_name"]'),
                 image: get('meta[property="og:image"]') || get('meta[name="twitter:image"]'),
+                video: get('meta[property="og:video:secure_url"]') || get('meta[property="og:video:url"]') || get('meta[property="og:video"]') || get('meta[property="twitter:player:stream"]'),
                 body: (document.body?.innerText || '').slice(0, 5000),
             };
         }""")
     finally:
         await context.close()
 
+    video = meta.get("video", "")
+    # 只收看起來是影片檔的（避免 og:video 指到 player 頁面）
+    video_urls = [video] if video and re.search(r"\.(mp4|m3u8|webm|mov)(\?|$)", video, re.I) else []
     parts = [p for p in (meta["title"], meta["description"], meta["body"]) if p]
     return {
         "text": "\n\n".join(parts),
         "author": meta.get("site_name", ""),
+        "video_urls": video_urls,
         "image_urls": [meta["image"]] if meta.get("image") else [],
     }
 
@@ -323,29 +356,188 @@ async def scrape_url(url: str, platform: str) -> dict:
         return await _scrape_generic(url)
 
 
+# ==== 多模態媒體處理（圖片下載 / 影片抽影格 / 地圖） ====
+_IMG_MIME = {"jpg": "image/jpeg", "jpeg": "image/jpeg", "png": "image/png",
+             "gif": "image/gif", "webp": "image/webp"}
+
+
+def _guess_media_type(url: str, content_type: str | None) -> str:
+    if content_type and content_type.split(";")[0].strip() in _IMG_MIME.values():
+        return content_type.split(";")[0].strip()
+    ext = url.split("?")[0].rsplit(".", 1)[-1].lower()
+    return _IMG_MIME.get(ext, "image/jpeg")
+
+
+def _fetch_image_block(url: str) -> dict | None:
+    """下載圖片 → base64 image content block。失敗回 None（不擋主流程）。"""
+    import httpx
+    try:
+        r = httpx.get(url, timeout=15, follow_redirects=True,
+                      headers={"User-Agent": USER_AGENT})
+        r.raise_for_status()
+        data = r.content
+        if not data or len(data) > 5_000_000:  # 跳過空檔 / 過大（>5MB）
+            return None
+        media_type = _guess_media_type(url, r.headers.get("content-type"))
+        return {
+            "type": "image",
+            "source": {"type": "base64", "media_type": media_type,
+                       "data": base64.standard_b64encode(data).decode()},
+        }
+    except Exception as e:
+        log.warning("[media] 圖片下載失敗 %s：%s", url[:80], e)
+        return None
+
+
+def _download_video(url: str) -> str | None:
+    """下載影片到暫存檔，回傳路徑（呼叫端負責刪）。失敗回 None。"""
+    import httpx
+    try:
+        fd, path = tempfile.mkstemp(suffix=".mp4")
+        with os.fdopen(fd, "wb") as f:
+            with httpx.stream("GET", url, timeout=60, follow_redirects=True,
+                              headers={"User-Agent": USER_AGENT}) as r:
+                r.raise_for_status()
+                for chunk in r.iter_bytes(65536):
+                    f.write(chunk)
+        return path
+    except Exception as e:
+        log.warning("[media] 影片下載失敗 %s：%s", url[:80], e)
+        return None
+
+
+def extract_video_frames(video_path: str, max_frames: int = VIDEO_MAX_FRAMES) -> list[dict]:
+    """用 ffmpeg 抽影格（場景偵測優先，太少則退回固定取樣），回傳 image content blocks。
+
+    參考業界做法：場景轉場才抽（select=gt(scene,T)），縮到 ~640px、壓在 max_frames 內，
+    讓 Claude 看畫面而不爆 token。ffmpeg 不存在或失敗則回空 list（不擋主流程）。
+    """
+    if not os.path.exists(video_path):
+        return []
+    tmpdir = tempfile.mkdtemp(prefix="frames_")
+    try:
+        scale = f"scale={VIDEO_FRAME_WIDTH}:-2"
+        # 第一輪：場景偵測抽轉場影格
+        scene_vf = f"select='gt(scene,{VIDEO_SCENE_THRESHOLD})',{scale}"
+        cmd = [FFMPEG_BIN, "-hide_banner", "-loglevel", "error", "-i", video_path,
+               "-vf", scene_vf, "-vsync", "vfr", "-frames:v", str(max_frames),
+               "-q:v", "4", os.path.join(tmpdir, "f%03d.jpg")]
+        try:
+            subprocess.run(cmd, check=True, timeout=120)
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError) as e:
+            log.warning("[media] ffmpeg 場景偵測失敗：%s", e)
+
+        frames = sorted(Path(tmpdir).glob("f*.jpg"))
+        # 退回方案：場景偵測抽不到（短片 / 無明顯轉場）→ 全片均勻取樣
+        if len(frames) < 2:
+            for p in frames:
+                p.unlink(missing_ok=True)
+            fps_vf = f"fps=1,{scale}"  # 每秒 1 張，再截斷到 max_frames
+            cmd = [FFMPEG_BIN, "-hide_banner", "-loglevel", "error", "-i", video_path,
+                   "-vf", fps_vf, "-frames:v", str(max_frames),
+                   "-q:v", "4", os.path.join(tmpdir, "f%03d.jpg")]
+            try:
+                subprocess.run(cmd, check=True, timeout=120)
+            except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError) as e:
+                log.warning("[media] ffmpeg 取樣失敗：%s", e)
+            frames = sorted(Path(tmpdir).glob("f*.jpg"))
+
+        blocks = []
+        for p in frames[:max_frames]:
+            data = p.read_bytes()
+            if data:
+                blocks.append({
+                    "type": "image",
+                    "source": {"type": "base64", "media_type": "image/jpeg",
+                               "data": base64.standard_b64encode(data).decode()},
+                })
+        log.info("[media] 抽出 %d 張影格（%s）", len(blocks), os.path.basename(video_path))
+        return blocks
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def maps_url(place: str) -> str:
+    """組 Google 地圖搜尋連結（免費、不需 API key）。"""
+    return f"https://www.google.com/maps/search/?api=1&query={quote_plus(place)}"
+
+
+def collect_media_blocks(source: dict) -> tuple[list[dict], int, int]:
+    """從 source 收集要送給 Claude 的視覺 content blocks。
+    回傳 (blocks, 圖片數, 影格數)。會下載圖片並對影片抽影格。"""
+    blocks, n_img, n_frame = [], 0, 0
+    for u in source.get("image_urls", [])[:MAX_IMAGES]:
+        blk = _fetch_image_block(u)
+        if blk:
+            blocks.append(blk)
+            n_img += 1
+    # 本地圖片檔（例如 Telegram 直接傳圖）
+    for path in source.get("local_image_paths", [])[:MAX_IMAGES]:
+        try:
+            data = Path(path).read_bytes()
+            if data and len(data) <= 5_000_000:
+                blocks.append({"type": "image", "source": {"type": "base64",
+                    "media_type": "image/jpeg",
+                    "data": base64.standard_b64encode(data).decode()}})
+                n_img += 1
+        except Exception as e:
+            log.warning("[media] 本地圖片讀取失敗 %s：%s", path, e)
+    for vurl in source.get("video_urls", [])[:1]:  # 一則先處理第一支影片
+        path = _download_video(vurl)
+        if path:
+            try:
+                fb = extract_video_frames(path)
+                blocks.extend(fb)
+                n_frame += len(fb)
+            finally:
+                Path(path).unlink(missing_ok=True)
+    # 已是本地影格路徑（例如 Telegram 直接傳影片）
+    for path in source.get("local_video_paths", []):
+        fb = extract_video_frames(path)
+        blocks.extend(fb)
+        n_frame += len(fb)
+    return blocks, n_img, n_frame
+
+
 # ==== Claude 分析 ====
-@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10),
-       before_sleep=before_sleep_log(log, logging.WARNING), reraise=True)
-def analyze_with_claude(text: str, platform: str, fallback_author: str = "") -> dict:
-    prompt = f"""分析以下「{platform}」來源的內容，回傳純 JSON（不含 markdown fence）：
+def _build_prompt(text: str, platform: str, fallback_author: str, has_visual: bool) -> str:
+    visual_hint = ""
+    if has_visual:
+        visual_hint = (
+            "\n附帶的圖片 / 影片影格就是這則內容的視覺主體，請實際「看圖」理解畫面"
+            "（人物、場景、招牌、菜色、商品、文字），別只靠文字。\n"
+        )
+    return f"""分析以下「{platform}」來源的內容，回傳純 JSON（不含 markdown fence）：
 {{
   "title": "20 字內主題（不要含作者帳號）",
-  "author": "原作者帳號或來源名稱；若提示為空且內容裡看得出作者就填，否則回空字串",
-  "summary": "整體內容描述（50 字內中文）",
+  "author": "原作者帳號或來源名稱；若提示為空且內容/畫面看得出作者就填，否則回空字串",
+  "summary": "整體內容描述（50 字內中文，若有圖/影片要描述畫面實際看到什麼）",
   "category": "從這四選一：{ ' / '.join(CATEGORIES) }",
-  "excerpt": "從內容直接摘錄 1 句最關鍵原句（不可改寫）；若是純文字筆記沒明顯金句就回空字串",
-  "keywords": ["3~5 個關鍵字"]
+  "excerpt": "從內容直接摘錄 1 句最關鍵原句（不可改寫）；沒有就回空字串",
+  "keywords": ["3~5 個關鍵字"],
+  "place": "若內容/畫面是某個實體地點（餐廳、店家、景點、地址），填可在 Google 地圖搜到的『店名或地名（含城市/區域更好）』；不是地點就回空字串"
 }}
-
+{visual_hint}
 提示：原作者 = {fallback_author!r}
 
-內容：
-{text[:6000]}
+文字內容：
+{text[:6000] if text else "（無文字，請以視覺為主）"}
 """
+
+
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10),
+       before_sleep=before_sleep_log(log, logging.WARNING), reraise=True)
+def analyze_with_claude(text: str, platform: str, fallback_author: str = "",
+                        media_blocks: list[dict] | None = None) -> dict:
+    media_blocks = media_blocks or []
+    has_visual = bool(media_blocks)
+    prompt = _build_prompt(text, platform, fallback_author, has_visual)
+    content = [*media_blocks, {"type": "text", "text": prompt}]
+    model = MODEL_VISION if has_visual else MODEL_TEXT
     resp = claude.messages.create(
-        model="claude-haiku-4-5-20251001",
-        max_tokens=600,
-        messages=[{"role": "user", "content": prompt}],
+        model=model,
+        max_tokens=700,
+        messages=[{"role": "user", "content": content}],
     )
     raw = re.sub(r"^```json\s*|\s*```$", "", resp.content[0].text.strip(), flags=re.MULTILINE).strip()
     result = json.loads(raw)
@@ -355,6 +547,8 @@ def analyze_with_claude(text: str, platform: str, fallback_author: str = "") -> 
         result["keywords"] = []
     if not result.get("author"):
         result["author"] = fallback_author
+    if not isinstance(result.get("place"), str):
+        result["place"] = ""
     return result
 
 
@@ -410,12 +604,23 @@ def write_to_notion(source: dict, analysis: dict) -> str:
         else:
             raise
 
-    image_urls = source.get("image_urls", [])[:10]
-    if image_urls:
-        notion.blocks.children.append(
-            block_id=page["id"],
-            children=[{"type": "image", "image": {"type": "external", "external": {"url": u}}} for u in image_urls],
-        )
+    children = []
+    # Google 地圖連結（內容是實體地點時）
+    place = (analysis.get("place") or "").strip()
+    if place:
+        link = maps_url(place)
+        children.append({
+            "type": "bookmark", "bookmark": {"url": link,
+                "caption": [{"type": "text", "text": {"content": f"🗺️ {place}"}}]},
+        })
+    # 原圖（Notion 接受 CDN URL，直接外嵌）
+    for u in source.get("image_urls", [])[:10]:
+        children.append({"type": "image", "image": {"type": "external", "external": {"url": u}}})
+    if children:
+        try:
+            notion.blocks.children.append(block_id=page["id"], children=children)
+        except Exception:
+            log.warning("[notion] 附加 children 失敗（地圖/圖片）", exc_info=True)
     return page["url"]
 
 
@@ -459,8 +664,10 @@ async def start(update: Update, _: ContextTypes.DEFAULT_TYPE):
         "💡 靈感收集機器人\n\n"
         "傳給我：\n"
         "• 任何網址（Threads / YouTube / X / IG / 一般文章）\n"
+        "• 圖片 → Claude 直接看圖分析\n"
+        "• 影片 / IG Reel → 自動抽影格看畫面\n"
         "• 或純文字筆記\n\n"
-        "我會自動摘要、分類、抽關鍵字、存進 Notion。\n\n"
+        "我會自動摘要、分類、抽關鍵字、看圖/影格、認出地點附 Google 地圖，存進 Notion。\n\n"
         "/stats — 今天存了幾則\n"
         "/recent — 最近 5 則"
     )
@@ -551,12 +758,25 @@ def _strip_urls(text: str) -> str:
 
 async def _process_one(source: dict) -> tuple[bool, str]:
     """處理一則來源，回傳 (success, 訊息行)"""
-    if not source.get("text", "").strip():
+    # 收集視覺素材（下載圖片 + 影片抽影格）
+    media_blocks, n_img, n_frame = await asyncio.to_thread(collect_media_blocks, source)
+    if not source.get("text", "").strip() and not media_blocks:
         return False, "❌ 沒抓到內容"
-    analysis = await asyncio.to_thread(analyze_with_claude, source["text"], source["platform"], source.get("author", ""))
+    analysis = await asyncio.to_thread(
+        analyze_with_claude, source.get("text", ""), source["platform"],
+        source.get("author", ""), media_blocks)
     page_url = await asyncio.to_thread(write_to_notion, source, analysis)
     kw = "，".join(analysis.get("keywords", [])[:5])
     line = f"✅ {analysis['title']}\n    🏷 {analysis['category']} ｜ 📡 {source['platform']}"
+    bits = []
+    if n_img:
+        bits.append(f"🖼 {n_img} 圖")
+    if n_frame:
+        bits.append(f"🎬 {n_frame} 影格")
+    if analysis.get("place"):
+        bits.append(f"🗺️ {analysis['place']}")
+    if bits:
+        line += "\n    " + " ｜ ".join(bits)
     if kw:
         line += f"\n    🔖 {kw}"
     line += f"\n    🔗 {page_url}"
@@ -625,6 +845,68 @@ async def handle_message(update: Update, _: ContextTypes.DEFAULT_TYPE):
             results.append(f"{prefix} ❌ {type(e).__name__}: {e}")
 
     await msg.edit_text("完成！\n\n" + "\n\n".join(results), disable_web_page_preview=True)
+
+
+async def _download_tg_file(context, file_id: str, suffix: str) -> str:
+    """下載 Telegram 檔案到暫存路徑，回傳路徑（呼叫端負責刪）。"""
+    tg_file = await context.bot.get_file(file_id)
+    fd, path = tempfile.mkstemp(suffix=suffix)
+    os.close(fd)
+    await tg_file.download_to_drive(path)
+    return path
+
+
+async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """使用者直接傳影片 / GIF / 圓形短片（例：IG Reel 分享到 Telegram）→ 抽影格分析。"""
+    if not _allowed(update):
+        await update.message.reply_text("⛔ 沒有權限")
+        return
+    m = update.message
+    media = m.video or m.animation or m.video_note
+    if not media:
+        return
+    msg = await m.reply_text("⏳ 下載影片...")
+    path = None
+    try:
+        path = await _download_tg_file(context, media.file_id, ".mp4")
+        caption = m.caption or ""
+        source = {"text": caption, "author": "", "image_urls": [],
+                  "platform": "影片", "local_video_paths": [path]}
+        await msg.edit_text("⏳ 抽影格 + Claude 分析...")
+        ok, line = await _process_one(source)
+        await msg.edit_text(line, disable_web_page_preview=True)
+    except Exception as e:
+        log.exception("處理影片失敗")
+        await msg.edit_text(f"❌ {type(e).__name__}: {e}")
+    finally:
+        if path:
+            Path(path).unlink(missing_ok=True)
+
+
+async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """使用者直接傳圖片 → 多模態分析（圖不會外嵌進 Notion，因為沒有公開 URL）。"""
+    if not _allowed(update):
+        await update.message.reply_text("⛔ 沒有權限")
+        return
+    m = update.message
+    if not m.photo:
+        return
+    msg = await m.reply_text("⏳ 下載圖片...")
+    path = None
+    try:
+        path = await _download_tg_file(context, m.photo[-1].file_id, ".jpg")  # [-1] = 最大解析度
+        caption = m.caption or ""
+        source = {"text": caption, "author": "", "image_urls": [],
+                  "platform": "圖片", "local_image_paths": [path]}
+        await msg.edit_text("⏳ Claude 看圖分析...")
+        ok, line = await _process_one(source)
+        await msg.edit_text(line, disable_web_page_preview=True)
+    except Exception as e:
+        log.exception("處理圖片失敗")
+        await msg.edit_text(f"❌ {type(e).__name__}: {e}")
+    finally:
+        if path:
+            Path(path).unlink(missing_ok=True)
 
 
 RAILWAY_API_TOKEN = os.environ.get("RAILWAY_API_TOKEN")
@@ -1092,6 +1374,8 @@ def main():
         )
         log.info(f"[main] 已註冊排程同步：每 {AUTO_SYNC_HOURS} 小時、每次最多 {AUTO_SYNC_MAX} 則")
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    app.add_handler(MessageHandler(filters.VIDEO | filters.ANIMATION | filters.VIDEO_NOTE, handle_video))
+    app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     log.info("靈感收集機器人 啟動中...")
     app.run_polling()
 
