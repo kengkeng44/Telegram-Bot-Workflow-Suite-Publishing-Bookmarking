@@ -60,7 +60,8 @@ flowchart LR
 **🤖 全自動同步（核心功能）**：設 `AUTO_SYNC_HOURS=6` 後，bot 每 6 小時自己掃 Threads 收藏夾，找新的貼文自動處理進 Notion — **連手動分享都不用了**。
 
 **指令**：
-- `/sync threads [N|all]` — 手動跑一次同步收藏夾（自動模式之外，想立刻同步用）
+- `/sync threads [N|all]` — 手動同步 Threads 收藏夾
+- `/sync instagram [N|all]` — 手動同步 IG 收藏夾（需設 `INSTAGRAM_STATE_JSON` + `INSTAGRAM_USERNAME`，跑 `get_ig_cookies.py` 產生 cookie）
 - `/start` — 開機問候
 - `/stats` — 看 Notion 收藏數
 - `/recent` — 最近 5 筆
@@ -96,9 +97,11 @@ flowchart LR
 | 變數 | 啟用什麼 |
 |---|---|
 | `THREADS_STATE_JSON` | 登入後爬完整 Threads 內容（跑 `get_cookies.py` 產生） |
+| `INSTAGRAM_STATE_JSON` | IG 收藏夾同步登入 cookie（跑 `get_ig_cookies.py` 產生） |
+| `INSTAGRAM_USERNAME` | IG 帳號（不含 @），組收藏夾網址 `/<帳號>/saved/` |
 | `INGEST_SECRET` | HTTP `/ingest` webhook 認證 |
 | `RAILWAY_API_TOKEN` | `/usage` 指令查 Railway 用量 |
-| `AUTO_SYNC_HOURS` | 排程同步間隔（小時，0 = 關閉） |
+| `AUTO_SYNC_HOURS` / `AUTO_SYNC_IG_HOURS` | Threads / IG 排程同步間隔（小時，0 = 關閉） |
 | `AUTO_SYNC_MAX` | 每次排程最多處理幾則（預設 20） |
 
 </details>

@@ -34,6 +34,10 @@ threads-bot/
 | `NOTION_DATABASE_ID` | 32 位英數 | 從 Notion Database URL 抓 |
 | `ANTHROPIC_API_KEY` | `sk-ant-api03-xxx` | console.anthropic.com |
 | `ALLOWED_USER_ID` | 整數 | 你的 Telegram User ID；設 `0` 表示不限制 |
+| `THREADS_STATE_JSON` | JSON 字串 | 選填，Threads 登入 cookie（`get_cookies.py` 產生），收藏夾同步用 |
+| `INSTAGRAM_STATE_JSON` | JSON 字串 | 選填，IG 登入 cookie（`get_ig_cookies.py` 產生），IG 收藏夾同步用 |
+| `INSTAGRAM_USERNAME` | 字串 | 選填，IG 帳號（不含 @），組收藏夾網址 `/<帳號>/saved/` |
+| `AUTO_SYNC_HOURS` / `AUTO_SYNC_IG_HOURS` | 整數 | 選填，Threads / IG 排程同步間隔（小時），0 = 關閉 |
 
 ---
 
@@ -164,6 +168,16 @@ re.search(r'"caption":\{"text":"([^"]+)"', html)
 **Google 地圖**：prompt 多要一個 `place` 欄位，Claude 從文字/畫面（招牌、店名）認出實體地點時填店名/地名；`maps_url(place)` 組免費搜尋連結（不需 API key），`write_to_notion` 以 bookmark block 附到 page。
 
 **舊版相容**：`claude-haiku-4-5-20251001`（速度快、便宜，分類任務夠用）
+
+### Instagram 收藏夾同步
+
+跟 Threads 同步同一套模式（登入 cookie + 滾動收藏頁抽 URL → 逐則跑多模態分析）：
+- **登入工具**：`get_ig_cookies.py` 本機跑，使用者自己在瀏覽器登入（含 2FA），輸出 storage_state JSON → `INSTAGRAM_STATE_JSON`。
+- **收藏夾網址**：`_ig_saved_urls()` 用 `INSTAGRAM_USERNAME` 組 `/<帳號>/saved/all-posts/`。
+- **抽 URL**：`_fetch_ig_saved_post_urls()` 滾動掃 `/(p|reel|tv)/<code>/`。
+- **逐則爬**：`_scrape_instagram()` cookie + 攔截 `/graphql/query`、`/api/v1/media/`，相容 private-api（`image_versions2`/`video_versions`/`carousel_media`）與 web GraphQL（`xdt_shortcode_media`/`display_url`/`video_url`/`edge_sidecar_to_children`）兩種 node shape，失敗退回 og meta（`_ig_from_og`）。
+- **指令 / 排程**：`/sync instagram [N|all]`；`AUTO_SYNC_IG_HOURS>0` 排程自動跑。`sync_cmd` / `_scheduled_sync_job` 經 `_saved_sources(target)` 與 `_finish_sync()` 平台共用。
+- ⚠️ IG 對自動化偵測比 Threads 兇，有限流 / 封號風險（使用者已知情同意）；改版時更新 `_ig_extract_node` / og fallback。
 
 **Prompt** 要求回傳純 JSON（不含 markdown fence）：
 ```json

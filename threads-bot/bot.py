@@ -33,10 +33,13 @@ NOTION_DATABASE_ID = os.environ["NOTION_DATABASE_ID"]
 ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
 ALLOWED_USER_ID = int(os.environ.get("ALLOWED_USER_ID", "0"))
 THREADS_STATE_JSON = os.environ.get("THREADS_STATE_JSON")  # 可選：登入後的 storage_state JSON
+INSTAGRAM_STATE_JSON = os.environ.get("INSTAGRAM_STATE_JSON")  # 可選：IG 登入 storage_state（跑 get_ig_cookies.py 產生）
+INSTAGRAM_USERNAME = os.environ.get("INSTAGRAM_USERNAME", "")  # IG 帳號（組收藏夾網址 /<user>/saved/ 用）
 BOT_USER_ID = int(TELEGRAM_TOKEN.split(":")[0])  # bot 自己的 user id = token 冒號前的數字
 INGEST_SECRET = os.environ.get("INGEST_SECRET")  # webhook 認證用的 secret，不設則 webhook 不啟動
-AUTO_SYNC_HOURS = int(os.environ.get("AUTO_SYNC_HOURS", "0"))  # 排程同步間隔（小時），0 = 關閉
+AUTO_SYNC_HOURS = int(os.environ.get("AUTO_SYNC_HOURS", "0"))  # Threads 排程同步間隔（小時），0 = 關閉
 AUTO_SYNC_MAX = int(os.environ.get("AUTO_SYNC_MAX", "20"))  # 每次排程同步最多處理幾則
+AUTO_SYNC_IG_HOURS = int(os.environ.get("AUTO_SYNC_IG_HOURS", "0"))  # IG 排程同步間隔（小時），0 = 關閉
 
 # ==== Clients & 共用狀態 ====
 notion = NotionClient(auth=NOTION_TOKEN)
@@ -313,6 +316,121 @@ async def _scrape_threads(url: str) -> dict:
     return {"text": "", "author": "", "image_urls": []}
 
 
+# ==== Instagram 專用 scrape（cookie + GraphQL 攔截，og fallback） ====
+def _ig_caption(node: dict) -> str:
+    """IG node 取 caption：private-api（caption.text）與 web GraphQL（edge_media_to_caption）兩種 shape。"""
+    c = node.get("caption")
+    if isinstance(c, dict) and isinstance(c.get("text"), str):
+        return c["text"]
+    if isinstance(c, str):
+        return c
+    return jmespath.search("edge_media_to_caption.edges[0].node.text", node) or ""
+
+
+def _ig_author(node: dict) -> str:
+    return (jmespath.search("user.username", node)
+            or jmespath.search("owner.username", node) or "")
+
+
+def _ig_media_urls(node: dict) -> tuple[list[str], list[str]]:
+    """回傳 (image_urls, video_urls)，同時相容 private-api 與 web GraphQL 兩種 node shape。"""
+    imgs = list(_extract_image_urls(node))         # image_versions2 / carousel_media（private-api）
+    vids = list(_extract_video_urls(node))         # video_versions（private-api）
+    # web GraphQL: display_url / video_url（單則）
+    for key, bucket in (("display_url", imgs), ("video_url", vids)):
+        v = node.get(key)
+        if v and v not in bucket:
+            bucket.append(v)
+    # web GraphQL: 輪播 edge_sidecar_to_children
+    for child in (jmespath.search("edge_sidecar_to_children.edges[*].node", node) or []):
+        vu, du = child.get("video_url"), child.get("display_url")
+        if vu and vu not in vids:
+            vids.append(vu)
+        elif du and du not in imgs:
+            imgs.append(du)
+    return imgs, vids
+
+
+def _ig_extract_node(data) -> dict | None:
+    """從攔截到的 IG JSON 找出貼文 media node。"""
+    sc = jmespath.search("data.xdt_shortcode_media || data.shortcode_media", data)
+    if isinstance(sc, dict):
+        return sc
+    for arr in _nested_lookup("items", data):
+        if isinstance(arr, list):
+            for it in arr:
+                if isinstance(it, dict) and any(
+                        k in it for k in ("image_versions2", "video_versions", "carousel_media")):
+                    return it
+    return None
+
+
+def _ig_from_og(html: str) -> dict | None:
+    """IG Open Graph 保底：og:description=caption、og:image、og:video（Reel）。"""
+    desc = _get_meta(html, "og:description")
+    title = _get_meta(html, "og:title") or ""
+    image = _get_meta(html, "og:image")
+    video = _get_meta(html, "og:video:secure_url") or _get_meta(html, "og:video")
+    if not (desc or image or video):
+        return None
+    m = re.search(r'@([\w.]+)', title)
+    author = m.group(1) if m else title.split(" on Instagram")[0].strip()
+    vids = [video] if video and re.search(r"\.(mp4|m3u8|webm|mov)(\?|$)", video, re.I) else []
+    return {"text": desc or "", "author": author,
+            "image_urls": [image] if image else [], "video_urls": vids}
+
+
+async def _scrape_instagram(url: str) -> dict:
+    log.info(f"[scrape_ig] start url={url}")
+    storage_state = json.loads(INSTAGRAM_STATE_JSON) if INSTAGRAM_STATE_JSON else None
+    browser = await _ensure_browser()
+    captured = []
+    context = await browser.new_context(user_agent=USER_AGENT, storage_state=storage_state)
+    await context.route("**/*", _block_heavy_resources)
+    page = await context.new_page()
+
+    async def _on_response(response):
+        u = response.url
+        if "/graphql/query" in u or "/api/v1/media/" in u:
+            try:
+                captured.append(await response.json())
+            except Exception:
+                pass
+
+    page.on("response", _on_response)
+    html = ""
+    try:
+        await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+        loop = asyncio.get_event_loop()
+        deadline = loop.time() + 8
+        while not captured and loop.time() < deadline:
+            await asyncio.sleep(0.2)
+        if captured:
+            await asyncio.sleep(0.6)
+        html = await page.content()
+    except Exception as e:
+        log.error(f"[scrape_ig] page.goto 失敗: {type(e).__name__}: {e}")
+    finally:
+        await context.close()
+
+    log.info(f"[scrape_ig] captured={len(captured)} responses, html_len={len(html)}")
+    for data in captured:
+        node = _ig_extract_node(data)
+        if node:
+            imgs, vids = _ig_media_urls(node)
+            log.info(f"[scrape_ig] ✅ node 命中 author={_ig_author(node)} img={len(imgs)} vid={len(vids)}")
+            return {"text": _ig_caption(node), "author": _ig_author(node),
+                    "image_urls": imgs, "video_urls": vids}
+
+    og = _ig_from_og(html)
+    if og:
+        log.info(f"[scrape_ig] ⚠️ og fallback 命中 author={og['author']}")
+        return og
+
+    log.warning(f"[scrape_ig] ❌ 全部失敗 html_len={len(html)}")
+    return {"text": "", "author": "", "image_urls": [], "video_urls": []}
+
+
 # ==== 通用網頁 scrape（meta tags + 正文） ====
 async def _scrape_generic(url: str) -> dict:
     browser = await _ensure_browser()
@@ -353,6 +471,8 @@ async def scrape_url(url: str, platform: str) -> dict:
     async with SCRAPE_SEM:
         if platform == "Threads":
             return await _scrape_threads(url)
+        if platform == "Instagram":
+            return await _scrape_instagram(url)
         return await _scrape_generic(url)
 
 
@@ -1071,19 +1191,155 @@ async def _fetch_saved_post_urls(saved_page_url: str) -> tuple[list[str], str]:
     return list(seen), final_url
 
 
+# ==== /sync 同步 Instagram 收藏夾 ====
+def _ig_saved_urls() -> list[str]:
+    """IG 收藏夾網址（需 INSTAGRAM_USERNAME）。"""
+    user = INSTAGRAM_USERNAME.strip().lstrip("@")
+    if not user:
+        return []
+    base = f"https://www.instagram.com/{user}/saved"
+    return [f"{base}/all-posts/", f"{base}/"]
+
+
+async def _fetch_ig_saved_post_urls(saved_page_url: str) -> tuple[list[str], str]:
+    """IG 登入 cookie 開收藏頁 → 滾動載入 → 抽出所有貼文 / Reel URL。
+    回傳 (post_urls, final_url)。"""
+    storage_state = json.loads(INSTAGRAM_STATE_JSON) if INSTAGRAM_STATE_JSON else None
+    if not storage_state:
+        raise RuntimeError("INSTAGRAM_STATE_JSON 未設，先跑 python get_ig_cookies.py 產生")
+    if not INSTAGRAM_USERNAME.strip():
+        raise RuntimeError("INSTAGRAM_USERNAME 未設（組收藏夾網址要用）")
+    browser = await _ensure_browser()
+    context = await browser.new_context(user_agent=USER_AGENT, storage_state=storage_state)
+    page = await context.new_page()
+    seen: set[str] = set()
+    final_url = saved_page_url
+    try:
+        await page.goto(saved_page_url, wait_until="domcontentloaded", timeout=30000)
+        final_url = page.url
+        log.info(f"[sync_ig] saved 頁 final URL: {final_url}")
+
+        def _scan_html(html: str):
+            for m in re.finditer(r'/(p|reel|tv)/([\w-]+)/', html):
+                seen.add(f"https://www.instagram.com/{m.group(1)}/{m.group(2)}/")
+
+        _scan_html(await page.content())
+        log.info(f"[sync_ig] 初始載入: {len(seen)} 則")
+
+        no_new_streak = 0
+        for i in range(1, 81):
+            prev_count = len(seen)
+            try:
+                await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+            except Exception:
+                pass
+            await asyncio.sleep(2.0)
+            _scan_html(await page.content())
+            delta = len(seen) - prev_count
+            log.info(f"[sync_ig] 滾動 {i}: +{delta}, 累計 {len(seen)}")
+            if delta == 0:
+                no_new_streak += 1
+                if no_new_streak >= 4:
+                    log.info("[sync_ig] 連續 4 次沒新貼文，停止滾動")
+                    break
+            else:
+                no_new_streak = 0
+    finally:
+        await context.close()
+    return list(seen), final_url
+
+
+# 各平台收藏夾設定：label → (saved_urls, fetch_fn)
+def _saved_sources(target: str):
+    if target in ("threads", "th"):
+        return "Threads", THREADS_SAVED_URLS, _fetch_saved_post_urls
+    if target in ("instagram", "ig"):
+        return "Instagram", _ig_saved_urls(), _fetch_ig_saved_post_urls
+    return None, [], None
+
+
+async def _finish_sync(update, msg, found, final_url, label, max_count, last_err=""):
+    """共用：把抓到的收藏夾 URL 清單去重、過濾已存、逐則跑多模態分析。"""
+    if not found:
+        await msg.edit_text(
+            f"❌ {label} 沒抓到任何貼文\nfinal URL: {final_url}\n最後錯誤: {last_err}")
+        return
+    cleaned = [_clean_url(u) for u in found]
+    existing = await asyncio.to_thread(_existing_urls_from_db)
+    new_urls = [u for u in cleaned if u not in existing]
+    if not new_urls:
+        await msg.edit_text(
+            f"✅ {label} 收藏夾找到 {len(cleaned)} 則，全部已在 Notion\n"
+            f"📍 final URL: {final_url}\n"
+            f"💡 數量明顯偏少的話，可能是收藏頁被導去首頁（cookie 過期或路徑錯）")
+        return
+
+    target_list = new_urls[:max_count]
+    total = len(target_list)
+    await msg.edit_text(
+        f"📥 {label} 收藏夾找到 {len(cleaned)} 則，{len(new_urls)} 則尚未進 Notion\n"
+        f"📍 final URL: {final_url}\n"
+        f"⏳ 開始處理 {total} 則（每則約 10–20 秒）...")
+
+    success = skip = fail = 0
+    fail_samples: list[str] = []
+
+    async def _one(u: str):
+        platform = detect_platform(u)
+        scraped = await scrape_url(u, platform)
+        source = {**scraped, "url": u, "platform": platform}
+        return await _process_one(source)
+
+    for i, url in enumerate(target_list, 1):
+        log.info(f"[sync_{label}] 處理 {i}/{total}: {url}")
+        try:
+            ok, _line = await asyncio.wait_for(_one(url), timeout=90.0)
+            success += 1 if ok else 0
+            skip += 0 if ok else 1
+        except asyncio.TimeoutError:
+            fail += 1
+            if len(fail_samples) < 3:
+                fail_samples.append(f"{url.rstrip('/').split('/')[-1][:20]}: Timeout 90s")
+        except Exception as e:
+            fail += 1
+            log.exception("[sync_%s] 處理 %s 失敗", label, url)
+            if len(fail_samples) < 3:
+                fail_samples.append(f"{url.rstrip('/').split('/')[-1][:20]}: {type(e).__name__}")
+        if i % 3 == 0 or i == total:
+            try:
+                await msg.edit_text(f"⏳ {label} 進度 {i}/{total}\n  ✅ {success}　⏭ {skip}　❌ {fail}")
+            except Exception:
+                pass
+
+    summary = (
+        f"✅ {label} 同步完成\n━━━━━━━━━━━━━━\n"
+        f"已處理：{total} 則\n  ✅ 成功：{success}\n  ⏭ 沒抓到內容：{skip}\n  ❌ 失敗：{fail}")
+    if fail_samples:
+        summary += "\n\n失敗範例：\n" + "\n".join(fail_samples)
+    if len(new_urls) > max_count:
+        summary += f"\n\n還剩 {len(new_urls) - max_count} 則，傳 `/sync {label.lower()} all` 處理剩下的"
+    await update.message.reply_text(summary, disable_web_page_preview=True)
+
+
 async def sync_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """
-    /sync threads          → 預設 5 則
-    /sync threads all      → 全部新的
-    /sync threads 30       → 自訂上限
+    /sync threads [N|all]     → 同步 Threads 收藏夾
+    /sync instagram [N|all]   → 同步 IG 收藏夾（也可用 ig）
+    不帶平台預設 threads。
     """
     if not _allowed(update):
         await update.message.reply_text("⛔ 沒有權限")
         return
     args = ctx.args or []
     target = (args[0].lower() if args else "threads")
-    if target != "threads":
-        await update.message.reply_text("目前只支援 `/sync threads [N|all]`")
+    label, saved_urls, fetch_fn = _saved_sources(target)
+    if not label:
+        await update.message.reply_text("用法：`/sync threads [N|all]` 或 `/sync instagram [N|all]`")
+        return
+    if not saved_urls:
+        await update.message.reply_text(
+            "❌ Instagram 收藏夾需要先設 `INSTAGRAM_USERNAME` 與 `INSTAGRAM_STATE_JSON`"
+            "（跑 `python get_ig_cookies.py` 產生 cookie）")
         return
 
     if len(args) >= 2:
@@ -1096,117 +1352,40 @@ async def sync_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     else:
         max_count = 5
 
-    msg = await update.message.reply_text("⏳ 開啟 Threads 收藏夾...")
+    msg = await update.message.reply_text(f"⏳ 開啟 {label} 收藏夾...")
     found: list[str] = []
     final_url = ""
     last_err = ""
-    for url in THREADS_SAVED_URLS:
+    for url in saved_urls:
         try:
-            posts, final_url = await _fetch_saved_post_urls(url)
+            posts, final_url = await fetch_fn(url)
             if posts:
                 found = posts
                 break
         except Exception as e:
             last_err = f"{type(e).__name__}: {e}"
-            log.warning(f"[sync_threads] 嘗試 {url} 失敗: {e}")
+            log.warning(f"[sync_{label}] 嘗試 {url} 失敗: {e}")
             continue
 
-    if not found:
-        await msg.edit_text(
-            f"❌ 沒抓到任何貼文\n"
-            f"final URL: {final_url}\n"
-            f"最後錯誤: {last_err}"
-        )
-        return
-
-    cleaned = [_clean_url(u) for u in found]
-    existing = await asyncio.to_thread(_existing_urls_from_db)
-    new_urls = [u for u in cleaned if u not in existing]
-    if not new_urls:
-        await msg.edit_text(
-            f"✅ 收藏夾找到 {len(cleaned)} 則，全部已存在 Notion\n"
-            f"📍 final URL: {final_url}\n"
-            f"💡 如果數量明顯比實際少，可能是 saved 頁被導去首頁（cookie 過期或 URL 路徑錯）"
-        )
-        return
-
-    target_list = new_urls[:max_count]
-    total = len(target_list)
-    await msg.edit_text(
-        f"📥 收藏夾找到 {len(cleaned)} 則貼文，{len(new_urls)} 則尚未進 Notion\n"
-        f"📍 final URL: {final_url}\n"
-        f"⏳ 開始處理 {total} 則（每則約 10–20 秒）..."
-    )
-
-    success = skip = fail = 0
-    fail_samples: list[str] = []
-
-    async def _process_url_with_timeout(u: str):
-        platform = detect_platform(u)
-        scraped = await scrape_url(u, platform)
-        source = {**scraped, "url": u, "platform": platform}
-        return await _process_one(source)
-
-    for i, url in enumerate(target_list, 1):
-        log.info(f"[sync_threads] 處理 {i}/{total}: {url}")
-        try:
-            ok, _line = await asyncio.wait_for(
-                _process_url_with_timeout(url), timeout=90.0
-            )
-            if ok:
-                success += 1
-            else:
-                skip += 1
-        except asyncio.TimeoutError:
-            fail += 1
-            log.warning(f"[sync_threads] 超時跳過: {url}")
-            if len(fail_samples) < 3:
-                fail_samples.append(f"{url.split('/')[-1][:20]}: Timeout 90s")
-        except Exception as e:
-            fail += 1
-            log.exception("[sync_threads] 處理 %s 失敗", url)
-            if len(fail_samples) < 3:
-                fail_samples.append(f"{url.split('/')[-1][:20]}: {type(e).__name__}")
-
-        # 每 3 則更新一次進度（避免 Telegram rate limit）
-        if i % 3 == 0 or i == total:
-            try:
-                await msg.edit_text(
-                    f"⏳ 進度 {i}/{total}\n"
-                    f"  ✅ {success}　⏭ {skip}　❌ {fail}"
-                )
-            except Exception:
-                pass
-
-    summary = (
-        f"✅ 同步完成\n"
-        f"━━━━━━━━━━━━━━\n"
-        f"已處理：{total} 則\n"
-        f"  ✅ 成功：{success}\n"
-        f"  ⏭ 沒抓到內容：{skip}\n"
-        f"  ❌ 失敗：{fail}"
-    )
-    if fail_samples:
-        summary += "\n\n失敗範例：\n" + "\n".join(fail_samples)
-    if len(new_urls) > max_count:
-        summary += f"\n\n還剩 {len(new_urls) - max_count} 則沒處理，傳 `/sync threads all` 處理剩下的"
-    await update.message.reply_text(summary, disable_web_page_preview=True)
+    await _finish_sync(update, msg, found, final_url, label, max_count, last_err)
 
 
-# ==== 排程：自動 sync threads ====
+# ==== 排程：自動 sync（Threads / Instagram） ====
 async def _scheduled_sync_job(context: ContextTypes.DEFAULT_TYPE):
-    """JobQueue 排程觸發，自動跑一次 /sync threads。"""
-    if not (ALLOWED_USER_ID and THREADS_STATE_JSON):
-        log.warning("[auto_sync] ALLOWED_USER_ID 或 THREADS_STATE_JSON 未設，跳過")
+    """JobQueue 排程觸發。context.job.data 帶平台（'threads' / 'instagram'），預設 threads。"""
+    platform_key = (getattr(context.job, "data", None) or "threads")
+    label, saved_urls, fetch_fn = _saved_sources(platform_key)
+    if not (ALLOWED_USER_ID and label and saved_urls):
+        log.warning(f"[auto_sync] {platform_key} 前置條件未滿足，跳過")
         return
     bot = context.bot
-    msg = await bot.send_message(chat_id=ALLOWED_USER_ID, text="🤖 排程：開始同步 Threads 收藏...")
+    msg = await bot.send_message(chat_id=ALLOWED_USER_ID, text=f"🤖 排程：開始同步 {label} 收藏...")
     try:
         found = []
         final_url = ""
-        for url in THREADS_SAVED_URLS:
+        for url in saved_urls:
             try:
-                posts, final_url = await _fetch_saved_post_urls(url)
+                posts, final_url = await fetch_fn(url)
                 if posts:
                     found = posts
                     break
@@ -1250,7 +1429,7 @@ async def _scheduled_sync_job(context: ContextTypes.DEFAULT_TYPE):
             f"✅ 成功 {success}　⏭ 跳過 {skip}　❌ 失敗 {fail}"
         )
         if len(new_urls) > AUTO_SYNC_MAX:
-            summary += f"\n剩 {len(new_urls) - AUTO_SYNC_MAX} 則沒處理（下次再跑或手動 /sync threads all）"
+            summary += f"\n剩 {len(new_urls) - AUTO_SYNC_MAX} 則沒處理（下次再跑或手動 /sync {label.lower()} all）"
         await msg.edit_text(summary)
     except Exception as e:
         log.exception("[auto_sync] 排程失敗")
@@ -1364,15 +1543,26 @@ def main():
     app.add_handler(CommandHandler("usage", usage_cmd))
     app.add_handler(CommandHandler("sync", sync_cmd))
 
-    # 排程自動同步（如果 AUTO_SYNC_HOURS > 0）
+    # 排程自動同步 Threads（AUTO_SYNC_HOURS > 0）
     if AUTO_SYNC_HOURS > 0 and app.job_queue:
         app.job_queue.run_repeating(
             _scheduled_sync_job,
             interval=AUTO_SYNC_HOURS * 3600,
             first=300,  # 啟動 5 分鐘後跑第一次
             name="auto_sync_threads",
+            data="threads",
         )
-        log.info(f"[main] 已註冊排程同步：每 {AUTO_SYNC_HOURS} 小時、每次最多 {AUTO_SYNC_MAX} 則")
+        log.info(f"[main] 已註冊 Threads 排程同步：每 {AUTO_SYNC_HOURS} 小時、每次最多 {AUTO_SYNC_MAX} 則")
+    # 排程自動同步 Instagram（AUTO_SYNC_IG_HOURS > 0）
+    if AUTO_SYNC_IG_HOURS > 0 and app.job_queue:
+        app.job_queue.run_repeating(
+            _scheduled_sync_job,
+            interval=AUTO_SYNC_IG_HOURS * 3600,
+            first=420,  # 啟動 7 分鐘後跑第一次（跟 Threads 錯開）
+            name="auto_sync_instagram",
+            data="instagram",
+        )
+        log.info(f"[main] 已註冊 IG 排程同步：每 {AUTO_SYNC_IG_HOURS} 小時、每次最多 {AUTO_SYNC_MAX} 則")
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(MessageHandler(filters.VIDEO | filters.ANIMATION | filters.VIDEO_NOTE, handle_video))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
