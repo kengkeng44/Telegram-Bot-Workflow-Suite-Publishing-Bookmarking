@@ -1,10 +1,10 @@
-# Data Hoarder（資料夾仍叫 `threads-bot/`）
+# threads-bot 專案說明
 
 ## 一句話描述
 
-Telegram bot：使用者傳任意網址（Threads / Instagram / FB / YouTube / Medium / 任何網頁）或純文字 → Playwright headless Chromium 爬取（Threads 走 GraphQL + `data-sjs` script tag + 登入 cookie；其他走 Open Graph + 主要文字）→ Claude Haiku 產出摘要／分類／標籤／情緒 → 寫入 Notion Database。
+Telegram bot：用戶傳 Threads 貼文連結（支援一次多則）→ Playwright headless Chromium 爬取 GraphQL 資料 → 原文寫入 Notion Database（狀態=待分析）→ 每天凌晨 3 點 Claude Code routine 用訂閱額度補標題／摘要／分類／關鍵字／原文摘錄，改狀態=待整理。
 
-> 資料夾名 `threads-bot/` 是歷史包袱（最初只支援 Threads），現在已多平台，對外暱稱 **Data Hoarder**。改名要協調 Railway Root Directory，記錄在頂層 TODO.md。
+**2026-10-29 起 bot 不再呼叫 Anthropic API**（`ANTHROPIC_API_KEY` 可從 Infisical/Railway 移除）。
 
 ---
 
@@ -32,7 +32,6 @@ threads-bot/
 | `TELEGRAM_TOKEN` | `1234567890:AAFxxx` | @BotFather 申請 |
 | `NOTION_TOKEN` | `ntn_xxx` | Notion Internal Integration Secret |
 | `NOTION_DATABASE_ID` | 32 位英數 | 從 Notion Database URL 抓 |
-| `ANTHROPIC_API_KEY` | `sk-ant-api03-xxx` | console.anthropic.com |
 | `ALLOWED_USER_ID` | 整數 | 你的 Telegram User ID；設 `0` 表示不限制 |
 
 ---
@@ -43,7 +42,6 @@ threads-bot/
 python-telegram-bot==21.6   # Telegram Bot 框架（async）
 playwright==1.48.0          # headless Chromium 爬蟲
 notion-client==2.2.1        # Notion 官方 SDK
-anthropic>=0.50.0           # Claude API（原釘 0.39.0，因 httpx proxies 相容性問題升為開放下界）
 jmespath==1.0.1             # 解析 GraphQL JSON
 python-dotenv==1.0.1        # 讀 .env
 tenacity==9.0.0             # 指數退避重試（網路 / rate limit）
@@ -147,23 +145,21 @@ re.search(r'"caption":\{"text":"([^"]+)"', html)
 
 **圖片解析**：`_extract_image_urls()` 從 `image_versions2.candidates[0]`（Threads 預設第一個是最大張）抓單張，再從 `carousel_media[*]` 抓多圖貼文，去重後回傳。HTML 備援不取圖。
 
-### analyze_with_claude(text) — AI 分析
+### 分析改由 Claude Code routine 執行（2026-10-29）
 
-**模型**：`claude-haiku-4-5-20251001`（速度快、便宜，分類任務夠用）
+- Routine：「Data Hoarder 凌晨分析」`trig_011rVTxedzPPJui3FyRVBC6D`，cron `0 19 * * *` UTC = 台北 03:00，Sonnet 5.5，只掛 Notion connector
+- 讀 Notion view `待分析（routine 用）`（view://4087854a-2f6c-81d5-ae9d-000c2c9b5e62），一次最多 40 頁
+- 原文在頁面內文的 paragraph block（bot 用 `_text_blocks()` 切 1900 字一段）
+- 改 prompt / 看執行紀錄：https://claude.ai/code/routines/trig_011rVTxedzPPJui3FyRVBC6D
 
-**Prompt** 要求回傳純 JSON（不含 markdown fence）：
-```json
-{
-  "summary": "30 字以內的中文摘要",
-  "category": "生活 | 工作 | 科技 | 財經 | 娛樂 | 學習 | 觀點 | 其他",
-  "tags": ["關鍵字1", "關鍵字2", "關鍵字3"],
-  "sentiment": "正面 | 中性 | 負面"
-}
-```
+### Threads 貼文解析（2026-10-29 修）
 
-**後處理**：
-- regex 清掉偶發的 ` ```json ` fence
-- sentiment 正規化：`.split("/")[0].strip()` → 避免 Claude 把 `"正面 / 中性 / 負面"` 整串寫進 Notion Select
+登入狀態下頁面會順便載首頁 feed（`data.feedData.edges[*].text_post_app_thread.thread_items[*].post`），舊的固定 jmespath `data.data.containing_thread...` 對不到，HTML 備援還會把 feed 第一則誤當目標。
+現在：`_collect_posts()` 遞迴收所有 `thread_items[*].post` → `_pick_post()` 用 URL 的 shortcode 比對 `post["code"]`。對不到就 dump 到 `last_failed_response.json`。
+
+### 去重
+
+`_existing_urls_from_db()` 讀 `原文連結`（URL 欄，2026-10-29 新增）＋舊資料標題上的 link。routine 會改寫標題，所以新資料靠 `原文連結` 去重。
 
 ### find_existing_notion_page(url) — 重複偵測
 

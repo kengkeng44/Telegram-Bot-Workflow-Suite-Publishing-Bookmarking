@@ -1,8 +1,8 @@
 """
 靈感收集機器人 (Telegram Bot)
 - 收任何 URL（Threads / YouTube / X / IG / 一般網頁）或純文字
-- Claude 分析摘要 / 分類 / 關鍵字 / 原文摘錄
-- 寫入 Notion Database
+- 原文寫入 Notion Database，狀態 = 待分析
+- 摘要 / 分類 / 關鍵字由每天凌晨 3 點的 Claude Code routine 補上（走訂閱額度，不呼叫 API）
 """
 import os
 import re
@@ -17,7 +17,6 @@ from telegram.ext import Application, MessageHandler, CommandHandler, filters, C
 from aiohttp import web
 from playwright.async_api import async_playwright
 from notion_client import Client as NotionClient
-from anthropic import Anthropic
 from tenacity import retry, stop_after_attempt, wait_exponential, before_sleep_log
 import jmespath
 
@@ -25,7 +24,6 @@ import jmespath
 TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
 NOTION_TOKEN = os.environ["NOTION_TOKEN"]
 NOTION_DATABASE_ID = os.environ["NOTION_DATABASE_ID"]
-ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
 ALLOWED_USER_ID = int(os.environ.get("ALLOWED_USER_ID", "0"))
 THREADS_STATE_JSON = os.environ.get("THREADS_STATE_JSON")  # 可選：登入後的 storage_state JSON
 BOT_USER_ID = int(TELEGRAM_TOKEN.split(":")[0])  # bot 自己的 user id = token 冒號前的數字
@@ -35,9 +33,8 @@ AUTO_SYNC_MAX = int(os.environ.get("AUTO_SYNC_MAX", "20"))  # 每次排程同步
 
 # ==== Clients & 共用狀態 ====
 notion = NotionClient(auth=NOTION_TOKEN)
-claude = Anthropic(api_key=ANTHROPIC_API_KEY)
 TZ_TAIPEI = timezone(timedelta(hours=8))
-CATEGORIES = ["AI科技", "生活風格", "學習成長", "設計創意"]
+STATUS_PENDING = "待分析"  # routine 分析完會改成「待整理」
 USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -120,26 +117,59 @@ def _nested_lookup(key: str, obj):
     return results
 
 
-def _extract_post_from_html(html: str) -> dict | None:
+def _shortcode(url: str) -> str | None:
+    """https://www.threads.com/@user/post/DXpiRZvEzVO → DXpiRZvEzVO"""
+    m = re.search(r"/post/([\w-]+)", url)
+    return m.group(1) if m else None
+
+
+def _collect_posts(obj) -> list[dict]:
+    """不管外層是 containing_thread 還是 feedData.edges，只要有 thread_items[*].post 都收進來。"""
+    posts = []
+    for items in _nested_lookup("thread_items", obj):
+        if isinstance(items, list):
+            for it in items:
+                post = it.get("post") if isinstance(it, dict) else None
+                if isinstance(post, dict):
+                    posts.append(post)
+    return posts
+
+
+def _pick_post(posts: list[dict], code: str | None) -> dict | None:
+    """用 shortcode 對到目標貼文。登入狀態下頁面會順便載首頁 feed，
+    不比對 code 會把 feed 第一則誤當成目標貼文。"""
+    if code:
+        return next((p for p in posts if p.get("code") == code), None)
+    return posts[0] if posts else None
+
+
+def _dump_failed_response(captured: list):
+    try:
+        Path(__file__).with_name("last_failed_response.json").write_text(
+            json.dumps(captured[0], ensure_ascii=False), encoding="utf-8"
+        )
+    except Exception as e:
+        log.warning(f"[scrape_threads] dump 失敗 response 出錯: {e}")
+
+
+def _extract_post_from_html(html: str, code: str | None) -> dict | None:
     """Threads 2026 改版：資料嵌在 <script type=\"application/json\" data-sjs> 內。"""
     pattern = r'<script[^>]*type="application/json"[^>]*data-sjs[^>]*>(.*?)</script>'
     matches = re.findall(pattern, html, re.DOTALL)
     log.info(f"[scrape_threads] HTML 中找到 {len(matches)} 個 data-sjs script tags")
 
-    # Path 1: 找含 thread_items 的（登入用戶版）
+    # Path 1: 找含 thread_items 的（登入用戶版），用 shortcode 對目標貼文
     candidates = [m for m in matches if "thread_items" in m]
     log.info(f"[scrape_threads] 含 thread_items: {len(candidates)} 個")
+    posts = []
     for raw in candidates:
         try:
-            data = json.loads(raw)
+            posts.extend(_collect_posts(json.loads(raw)))
         except Exception:
             continue
-        for items in _nested_lookup("thread_items", data):
-            if isinstance(items, list):
-                for it in items:
-                    post = it.get("post") if isinstance(it, dict) else None
-                    if post and isinstance(post, dict):
-                        return post
+    post = _pick_post(posts, code)
+    if post:
+        return post
 
     # Path 2: 找含 caption 的任何 script tag，nested_lookup 拼湊資料（未登入版常用）
     cap_candidates = [m for m in matches if '"caption"' in m and '"text"' in m]
@@ -241,24 +271,26 @@ async def _scrape_threads(url: str) -> dict:
 
     log.info(f"[scrape_threads] captured={len(captured)} graphql responses, html_len={len(html)}")
 
-    for data in captured:
-        node = jmespath.search("data.data.containing_thread.thread_items[*].post | [0]", data)
-        if node:
-            log.info(f"[scrape_threads] ✅ jmespath 命中 node, author={node.get('user', {}).get('username', '')}")
-            return {
-                "text": (node.get("caption") or {}).get("text", ""),
-                "author": node.get("user", {}).get("username", ""),
-                "image_urls": _extract_image_urls(node),
-            }
+    code = _shortcode(url)
+    posts = [p for data in captured for p in _collect_posts(data)]
+    node = _pick_post(posts, code)
+    if node:
+        log.info(f"[scrape_threads] ✅ graphql 命中 code={code}, author={node.get('user', {}).get('username', '')}")
+        return {
+            "text": (node.get("caption") or {}).get("text", ""),
+            "author": node.get("user", {}).get("username", ""),
+            "image_urls": _extract_image_urls(node),
+        }
 
     if captured:
         log.warning(
-            f"[scrape_threads] 抓到 {len(captured)} 個 graphql response 但 jmespath 都找不到節點。"
-            f"第一個 response 的 top-level keys: {list(captured[0].keys()) if isinstance(captured[0], dict) else type(captured[0]).__name__}"
+            f"[scrape_threads] 抓到 {len(captured)} 個 graphql response、{len(posts)} 則貼文，"
+            f"但沒有 code={code}。已 dump 第一個 response 到 last_failed_response.json"
         )
+        _dump_failed_response(captured)
 
     # 新版 Threads (2026) 改用 server-side render，資料嵌在 HTML script tag
-    post_node = _extract_post_from_html(html)
+    post_node = _extract_post_from_html(html, code)
     if post_node:
         log.info(f"[scrape_threads] ✅ HTML script tag fallback 命中, author={post_node.get('user', {}).get('username', '')}")
         return {
@@ -323,39 +355,22 @@ async def scrape_url(url: str, platform: str) -> dict:
         return await _scrape_generic(url)
 
 
-# ==== Claude 分析 ====
-@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10),
-       before_sleep=before_sleep_log(log, logging.WARNING), reraise=True)
-def analyze_with_claude(text: str, platform: str, fallback_author: str = "") -> dict:
-    prompt = f"""分析以下「{platform}」來源的內容，回傳純 JSON（不含 markdown fence）：
-{{
-  "title": "20 字內主題（不要含作者帳號）",
-  "author": "原作者帳號或來源名稱；若提示為空且內容裡看得出作者就填，否則回空字串",
-  "summary": "整體內容描述（50 字內中文）",
-  "category": "從這四選一：{ ' / '.join(CATEGORIES) }",
-  "excerpt": "從內容直接摘錄 1 句最關鍵原句（不可改寫）；若是純文字筆記沒明顯金句就回空字串",
-  "keywords": ["3~5 個關鍵字"]
-}}
+# ==== 暫定標題（正式標題由 routine 分析後覆寫） ====
+def _draft_title(text: str, author: str) -> str:
+    first_line = next((ln.strip() for ln in text.splitlines() if ln.strip()), "（無內容）")
+    title = first_line[:40] + ("…" if len(first_line) > 40 else "")
+    if author:
+        title += f"（{author}）" if author.startswith("@") else f"（@{author}）"
+    return title[:100]
 
-提示：原作者 = {fallback_author!r}
 
-內容：
-{text[:6000]}
-"""
-    resp = claude.messages.create(
-        model="claude-haiku-4-5-20251001",
-        max_tokens=600,
-        messages=[{"role": "user", "content": prompt}],
-    )
-    raw = re.sub(r"^```json\s*|\s*```$", "", resp.content[0].text.strip(), flags=re.MULTILINE).strip()
-    result = json.loads(raw)
-    if result.get("category") not in CATEGORIES:
-        result["category"] = "AI科技"
-    if not isinstance(result.get("keywords"), list):
-        result["keywords"] = []
-    if not result.get("author"):
-        result["author"] = fallback_author
-    return result
+def _text_blocks(text: str, chunk: int = 1900, max_blocks: int = 80) -> list[dict]:
+    """原文切成段落 block（Notion 單一 rich_text 上限 2000 字），給 routine 讀。"""
+    pieces = [text[i:i + chunk] for i in range(0, len(text), chunk)][:max_blocks]
+    return [
+        {"type": "paragraph", "paragraph": {"rich_text": [{"type": "text", "text": {"content": p}}]}}
+        for p in pieces
+    ]
 
 
 # ==== Notion ====
@@ -367,6 +382,9 @@ def _existing_urls_from_db() -> set[str]:
             kwargs["start_cursor"] = cursor
         resp = notion.databases.query(**kwargs)
         for p in resp["results"]:
+            # 原文連結欄（2026-10 起）優先；舊資料只有標題上的 link
+            if p["properties"].get("原文連結", {}).get("url"):
+                urls.add(p["properties"]["原文連結"]["url"])
             for t in p["properties"].get("標題", {}).get("title", []):
                 link = (t.get("text") or {}).get("link") or {}
                 if link.get("url"):
@@ -379,44 +397,37 @@ def _existing_urls_from_db() -> set[str]:
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10),
        before_sleep=before_sleep_log(log, logging.WARNING), reraise=True)
-def write_to_notion(source: dict, analysis: dict) -> str:
-    """source 必含 'platform'；可選 'url'、'image_urls'"""
-    author = analysis.get("author", "")
-    title = analysis["title"][:60]
-    if author:
-        title = f"{title}（@{author}）" if not author.startswith("@") else f"{title}（{author}）"
-    title = title[:100]
-
+def write_to_notion(source: dict) -> tuple[str, str]:
+    """只寫原文，狀態 = 待分析。source 必含 'platform'、'text'；可選 'url'、'author'、'image_urls'。
+    回傳 (page_url, 暫定標題)"""
+    title = _draft_title(source["text"], source.get("author", ""))
     title_text = {"content": title}
     if source.get("url"):
         title_text["link"] = {"url": source["url"]}
 
     properties = {
         "標題": {"title": [{"text": title_text}]},
-        "摘要": {"rich_text": [{"text": {"content": analysis["summary"][:2000]}}]},
-        "分類": {"select": {"name": analysis["category"]}},
-        "狀態": {"select": {"name": "待整理"}},
-        "原文摘錄": {"rich_text": [{"text": {"content": (analysis.get("excerpt") or "")[:2000]}}]},
+        "狀態": {"select": {"name": STATUS_PENDING}},
         "平台": {"select": {"name": source["platform"]}},
-        "關鍵字": {"multi_select": [{"name": k[:100]} for k in analysis.get("keywords", [])[:10] if k]},
     }
-
-    try:
-        page = notion.pages.create(parent={"database_id": NOTION_DATABASE_ID}, properties=properties)
-    except Exception as e:
-        if "狀態" in str(e) or "status" in str(e).lower():
-            properties["狀態"] = {"status": {"name": "待整理"}}
-            page = notion.pages.create(parent={"database_id": NOTION_DATABASE_ID}, properties=properties)
-        else:
-            raise
+    if source.get("url"):
+        properties["原文連結"] = {"url": source["url"]}
+    page = notion.pages.create(
+        parent={"database_id": NOTION_DATABASE_ID},
+        properties=properties,
+        children=_text_blocks(source["text"]),
+    )
 
     image_urls = source.get("image_urls", [])[:10]
     if image_urls:
-        notion.blocks.children.append(
-            block_id=page["id"],
-            children=[{"type": "image", "image": {"type": "external", "external": {"url": u}}} for u in image_urls],
-        )
-    return page["url"]
+        try:
+            notion.blocks.children.append(
+                block_id=page["id"],
+                children=[{"type": "image", "image": {"type": "external", "external": {"url": u}}} for u in image_urls],
+            )
+        except Exception:
+            log.warning("圖片 block 寫入失敗（原文已存）", exc_info=True)
+    return page["url"], title
 
 
 def _count_today_in_notion() -> int:
@@ -460,7 +471,7 @@ async def start(update: Update, _: ContextTypes.DEFAULT_TYPE):
         "傳給我：\n"
         "• 任何網址（Threads / YouTube / X / IG / 一般文章）\n"
         "• 或純文字筆記\n\n"
-        "我會自動摘要、分類、抽關鍵字、存進 Notion。\n\n"
+        "我會先把原文存進 Notion，凌晨 3 點再自動補摘要、分類、關鍵字。\n\n"
         "/stats — 今天存了幾則\n"
         "/recent — 最近 5 則"
     )
@@ -553,13 +564,8 @@ async def _process_one(source: dict) -> tuple[bool, str]:
     """處理一則來源，回傳 (success, 訊息行)"""
     if not source.get("text", "").strip():
         return False, "❌ 沒抓到內容"
-    analysis = await asyncio.to_thread(analyze_with_claude, source["text"], source["platform"], source.get("author", ""))
-    page_url = await asyncio.to_thread(write_to_notion, source, analysis)
-    kw = "，".join(analysis.get("keywords", [])[:5])
-    line = f"✅ {analysis['title']}\n    🏷 {analysis['category']} ｜ 📡 {source['platform']}"
-    if kw:
-        line += f"\n    🔖 {kw}"
-    line += f"\n    🔗 {page_url}"
+    page_url, title = await asyncio.to_thread(write_to_notion, source)
+    line = f"✅ {title}\n    📡 {source['platform']} ｜ 🕒 {STATUS_PENDING}（凌晨 3 點分析）\n    🔗 {page_url}"
     return True, line
 
 
@@ -615,7 +621,7 @@ async def handle_message(update: Update, _: ContextTypes.DEFAULT_TYPE):
                 await msg.edit_text(f"⏳ {prefix} 純文字筆記...")
                 source = {"text": payload, "author": "", "image_urls": [], "platform": "純文字"}
 
-            await msg.edit_text(f"⏳ {prefix} Claude 分析...")
+            await msg.edit_text(f"⏳ {prefix} 寫入 Notion...")
             ok, line = await _process_one(source)
             if ok and kind == "url":
                 existing.add(payload)
@@ -998,7 +1004,7 @@ async def _process_via_webhook(url: str):
         await msg.edit_text(f"⏳ 爬取 {platform}...")
         scraped = await scrape_url(cleaned, platform)
         source = {**scraped, "url": cleaned, "platform": platform}
-        await msg.edit_text("⏳ Claude 分析...")
+        await msg.edit_text("⏳ 寫入 Notion...")
         ok, line = await _process_one(source)
         await msg.edit_text(f"完成（webhook）\n\n{line}", disable_web_page_preview=True)
     except Exception as e:
