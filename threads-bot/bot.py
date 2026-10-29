@@ -39,6 +39,8 @@ USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
+# httpx 的 INFO 會印完整 request URL，Telegram API 網址含 bot token
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 # 共用 browser + 序列化 scrape
 _browser = None
@@ -124,14 +126,18 @@ def _shortcode(url: str) -> str | None:
 
 
 def _collect_posts(obj) -> list[dict]:
-    """不管外層是 containing_thread 還是 feedData.edges，只要有 thread_items[*].post 都收進來。"""
+    """遞迴收集所有「長得像貼文」的 dict（同時有 code 與 caption）。
+    外層結構一直變（containing_thread → feedData.edges → 2026-10 的 result.data.media），
+    只認貼文本身的欄位就不怕外層改版。"""
     posts = []
-    for items in _nested_lookup("thread_items", obj):
-        if isinstance(items, list):
-            for it in items:
-                post = it.get("post") if isinstance(it, dict) else None
-                if isinstance(post, dict):
-                    posts.append(post)
+    if isinstance(obj, dict):
+        if "code" in obj and "caption" in obj:
+            posts.append(obj)
+        for v in obj.values():
+            posts.extend(_collect_posts(v))
+    elif isinstance(obj, list):
+        for v in obj:
+            posts.extend(_collect_posts(v))
     return posts
 
 
@@ -158,9 +164,9 @@ def _extract_post_from_html(html: str, code: str | None) -> dict | None:
     matches = re.findall(pattern, html, re.DOTALL)
     log.info(f"[scrape_threads] HTML 中找到 {len(matches)} 個 data-sjs script tags")
 
-    # Path 1: 找含 thread_items 的（登入用戶版），用 shortcode 對目標貼文
-    candidates = [m for m in matches if "thread_items" in m]
-    log.info(f"[scrape_threads] 含 thread_items: {len(candidates)} 個")
+    # Path 1: 找含目標 shortcode 的 script，用 shortcode 對目標貼文
+    candidates = [m for m in matches if (code in m if code else '"caption"' in m)]
+    log.info(f"[scrape_threads] 含 code={code}: {len(candidates)} 個")
     posts = []
     for raw in candidates:
         try:
@@ -172,6 +178,9 @@ def _extract_post_from_html(html: str, code: str | None) -> dict | None:
         return post
 
     # Path 2: 找含 caption 的任何 script tag，nested_lookup 拼湊資料（未登入版常用）
+    # 只在網址沒有 shortcode 時用：拿第一段 caption 可能是別則貼文
+    if code:
+        return None
     cap_candidates = [m for m in matches if '"caption"' in m and '"text"' in m]
     log.info(f"[scrape_threads] 含 caption+text: {len(cap_candidates)} 個")
     for raw in cap_candidates:
@@ -282,13 +291,6 @@ async def _scrape_threads(url: str) -> dict:
             "image_urls": _extract_image_urls(node),
         }
 
-    if captured:
-        log.warning(
-            f"[scrape_threads] 抓到 {len(captured)} 個 graphql response、{len(posts)} 則貼文，"
-            f"但沒有 code={code}。已 dump 第一個 response 到 last_failed_response.json"
-        )
-        _dump_failed_response(captured)
-
     # 新版 Threads (2026) 改用 server-side render，資料嵌在 HTML script tag
     post_node = _extract_post_from_html(html, code)
     if post_node:
@@ -299,7 +301,7 @@ async def _scrape_threads(url: str) -> dict:
             "image_urls": _extract_image_urls(post_node),
         }
 
-    match = re.search(r'"caption":\{"text":"([^"]+)"', html)
+    match = None if code else re.search(r'"caption":\{"text":"([^"]+)"', html)
     if match:
         log.info("[scrape_threads] ⚠️ regex fallback 命中（無作者/圖片）")
         return {"text": match.group(1), "author": "", "image_urls": []}
@@ -311,9 +313,11 @@ async def _scrape_threads(url: str) -> dict:
         return og
 
     log.warning(
-        f"[scrape_threads] ❌ 全部失敗。captured={len(captured)}, html_len={len(html)}, "
+        f"[scrape_threads] ❌ 全部失敗。code={code}, captured={len(captured)}, html_len={len(html)}, "
         f"final_url={final_url}, page_status={page_status}"
     )
+    if captured:
+        _dump_failed_response(captured)
     return {"text": "", "author": "", "image_urls": []}
 
 
