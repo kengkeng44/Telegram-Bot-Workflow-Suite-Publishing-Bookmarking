@@ -120,8 +120,8 @@ def _nested_lookup(key: str, obj):
 
 
 def _shortcode(url: str) -> str | None:
-    """https://www.threads.com/@user/post/DXpiRZvEzVO → DXpiRZvEzVO"""
-    m = re.search(r"/post/([\w-]+)", url)
+    """https://www.threads.com/@user/post/DXpiRZvEzVO → DXpiRZvEzVO；Meta 匯出的 /t/CODE 也認"""
+    m = re.search(r"threads\.(?:net|com)/(?:t|@[\w.]+/post)/([\w-]+)", url)
     return m.group(1) if m else None
 
 
@@ -849,7 +849,9 @@ async def sync_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     cleaned = [_clean_url(u) for u in found]
     existing = await asyncio.to_thread(_existing_urls_from_db)
-    new_urls = [u for u in cleaned if u not in existing]
+    # Meta 匯出匯入的是 /t/CODE，跟收藏夾的 /@user/post/CODE 要用 shortcode 比
+    existing_codes = {c for c in map(_shortcode, existing) if c}
+    new_urls = [u for u in cleaned if u not in existing and _shortcode(u) not in existing_codes]
     if not new_urls:
         await msg.edit_text(
             f"✅ 收藏夾找到 {len(cleaned)} 則，全部已存在 Notion\n"
@@ -946,7 +948,9 @@ async def _scheduled_sync_job(context: ContextTypes.DEFAULT_TYPE):
 
         cleaned = [_clean_url(u) for u in found]
         existing = await asyncio.to_thread(_existing_urls_from_db)
-        new_urls = [u for u in cleaned if u not in existing]
+        # Meta 匯出匯入的是 /t/CODE，跟收藏夾的 /@user/post/CODE 要用 shortcode 比
+        existing_codes = {c for c in map(_shortcode, existing) if c}
+        new_urls = [u for u in cleaned if u not in existing and _shortcode(u) not in existing_codes]
         if not new_urls:
             await msg.edit_text(f"🤖 排程：{len(cleaned)} 則收藏，全部已在 Notion，無新增")
             return
